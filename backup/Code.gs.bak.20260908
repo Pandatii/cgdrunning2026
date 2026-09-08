@@ -1,0 +1,1607 @@
+/*************************************************************
+ * ระบบจัดการเสื้อวิ่ง (Shirt Order Management System) v4
+ * กรมบัญชีกลาง
+ * -----------------------------------------------------------
+ * หมายเหตุความปลอดภัย: ทุกฟังก์ชันที่ google.script.run เรียกได้
+ * (ไม่มี _ ต่อท้าย) จะตรวจสอบ session token ก่อนทำงานเสมอ ผ่าน
+ * requireAuth(token) / requireAuth(token, 'SuperAdmin') /
+ * requireAuth(token, ['SuperAdmin','Central']) — ไม่ได้พึ่งพา
+ * การตั้งชื่อฟังก์ชันเป็นเครื่องมือควบคุมสิทธิ์อีกต่อไป
+ *
+ * v4 - Requirement 2026-08-14 (Phase 1):
+ *  - Role model: SuperAdmin / Central (ส่วนกลาง) / Branch (หน่วยขาย)
+ *    แทน Admin/Staff เดิม พร้อม unit-scoping สำหรับ Branch
+ *  - ขนาดเสื้อขยายเป็น 14 ไซส์ (XS-10XL) พร้อมข้อจำกัดตามประเภทการจอง
+ *  - เพิ่มประเภทการจองที่ 4: Staff (ตัดสต็อกแจกพนักงาน ไม่มีการชำระเงิน)
+ *  - รองรับ Overbooking (ตัดสต็อกติดลบได้ ไม่บล็อกการจองอีกต่อไป)
+ *  - สถานะสต็อก 4 สี (blue/green/yellow/red) ตาม buffer stock
+ *  - Auto-cancel: ตัดรอบตามเวลา cutoff ที่ตั้งค่าได้ (default 23:30
+ *    ของวันเดียวกับที่จอง) แทนการนับ 24 ชม. แบบเดิม
+ *************************************************************/
+
+const SHEET_USERS       = 'Users';
+const SHEET_LOG         = 'Log';
+const SHEET_UNITS       = 'Units';
+const SHEET_ORDERS      = 'Orders';
+const SHEET_ORDER_ITEMS = 'OrderItems';
+const SHEET_STOCK       = 'Stock';
+const SHEET_ROUNDS      = 'StockRounds';
+const SHEET_ROUND_ITEMS = 'StockRoundItems';
+const SHEET_SETTINGS    = 'Settings';
+
+// ไซส์เสื้อทั้งหมดที่ระบบรองรับ (ตั้งค่าได้ผ่าน Settings key 'SizeList' ในอนาคต - Phase 1 คงที่ตาม requirement)
+const SIZES = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL', '6XL', '7XL', '8XL', '9XL', '10XL'];
+// ไซส์ที่ขายได้สำหรับช่องทางทั่วไป (General/Agent/Donate) - ไม่รวม Staff ซึ่งเลือกได้ทุกไซส์
+const SIZES_PUBLIC = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL'];
+
+// ประเภทการจอง (Channel) ทั้ง 4 แบบ
+const CHANNEL_STANDARD   = 'Standard';   // การขายทั่วไปผ่านหน่วยงานขายทั่วประเทศ (General Sales) - มีใบ Payin
+const CHANNEL_PATRUNNING = 'Patrunning'; // การขายผ่านตัวแทน (Agent Sales) - ไม่มีใบ Payin
+const CHANNEL_DONATE     = 'Donate';     // การรับบริจาค/ผู้สนับสนุน (Donation/Sponsorship) - ไม่มีใบ Payin
+const CHANNEL_STAFF      = 'Staff';      // การตัดสต็อกสำหรับเจ้าหน้าที่ (Staff Order) - ไม่มีการชำระเงิน
+
+// Role ที่ระบบรองรับ (fixed role, ไม่ใช่ menu-level permission ที่ config เองได้)
+const ROLE_SUPERADMIN = 'SuperAdmin';
+const ROLE_CENTRAL    = 'Central';
+const ROLE_BRANCH     = 'Branch';
+const ROLE_PATRUNNING = 'Patrunning'; // เห็น/บันทึกได้เฉพาะ order channel Patrunning
+const ROLE_DONATE     = 'Donate';     // เห็น/บันทึกได้เฉพาะ order channel Donate
+const ROLE_STAFF      = 'Staff';      // เห็น/บันทึกได้เฉพาะ order channel Staff + มีสิทธิ์ปรับเปลี่ยนขนาดเสื้อด้วย
+const ALL_ROLES = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_BRANCH, ROLE_PATRUNNING, ROLE_DONATE, ROLE_STAFF];
+// สิทธิ์ตาม matrix ที่ตกลงกัน (2026-08): Stock/ไฟล์ชำระเงิน = SuperAdmin+Central เท่านั้น
+const ROLES_BACKOFFICE = [ROLE_SUPERADMIN, ROLE_CENTRAL];
+// รายงาน: ทุก role เห็นได้ ยกเว้น Branch
+const ROLES_REPORTS = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_PATRUNNING, ROLE_DONATE, ROLE_STAFF];
+// ปรับเปลี่ยนขนาดเสื้อ: SuperAdmin + Staff role เท่านั้น
+const ROLES_SIZEREVISION = [ROLE_SUPERADMIN, ROLE_STAFF];
+// จัดการผู้ใช้งาน + ประวัติการใช้งาน: SuperAdmin + Central
+const ROLES_USERADMIN = [ROLE_SUPERADMIN, ROLE_CENTRAL];
+
+const CACHE_TTL = 30;         // วินาที - cache สรุปสต็อก/แดชบอร์ดเพื่อความเร็ว
+const UNITS_CACHE_TTL = 300;  // วินาที - หน่วยขายเปลี่ยนไม่บ่อย cache ได้นานกว่า
+const SESSION_TTL = 21600;    // วินาที (6 ชม.) - อายุ session สูงสุดที่ CacheService รองรับ
+
+// อัปเดตค่านี้ทุกครั้งที่ deploy เวอร์ชันใหม่ (แสดงที่ footer หน้าเว็บ เพื่อให้ตรวจสอบได้ว่าเทสต์ตรงเวอร์ชันจริงหรือไม่)
+const APP_VERSION = '2026-09-03 (Asia/Bangkok) - v7.9 - PROD';
+
+/*************************************************************
+ * WEB APP ENTRY POINT
+ *************************************************************/
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+      .setTitle('ระบบจัดการเสื้อวิ่ง - กรมบัญชีกลาง')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/*************************************************************
+ * UTILITIES (ใช้ภายในเท่านั้น แต่ตั้งชื่อแบบไม่มี _
+ * เพราะไม่ได้พึ่งพาการตั้งชื่อเพื่อควบคุมสิทธิ์อีกต่อไป —
+ * ความปลอดภัยจริงอยู่ที่ requireAuth() ด้านล่าง)
+ *************************************************************/
+function ssGet() { return SpreadsheetApp.getActiveSpreadsheet(); }
+function sheetGet(name) {
+  const sh = ssGet().getSheetByName(name);
+  if (!sh) throw new Error('ไม่พบชีท: ' + name);
+  return sh;
+}
+function cacheGet() { return CacheService.getScriptCache(); }
+function clearCache() {
+  cacheGet().removeAll(['stockSummary', 'dashboardBase']);
+}
+function clearUnitsCache() {
+  cacheGet().remove('unitsList');
+}
+
+// ไม่ต้อง login ก็เรียกได้ (แสดงที่หน้า login ให้ตรวจสอบเวอร์ชันได้ทันทีโดยไม่ต้องเข้าระบบ)
+function getAppVersion() {
+  return safeJson({ version: APP_VERSION });
+}
+
+/**
+ * บังคับให้ค่าที่จะส่งกลับไปหา client เป็น JSON-safe ล้วนๆ (plain object/array/string/number/boolean/null)
+ * แก้ปัญหา Apps Script บางครั้ง serialize array ของ object ไม่สำเร็จแล้วส่ง Java toString()
+ * กลับมาแทน (เช่น "[Ljava.lang.Object;@xxxxx") ทำให้ google.script.run รับค่าผิดเพี้ยน
+ */
+function safeJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function readTable(name) {
+  const sh = sheetGet(name);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return { headers: values[0] || [], rows: [] };
+  const headers = values[0];
+  const rows = values.slice(1)
+    .filter(r => r.join('') !== '')
+    .map((r, idx) => {
+      const obj = { _row: idx + 2 };
+      headers.forEach((h, i) => obj[h] = r[i]);
+      return obj;
+    });
+  return { headers, rows };
+}
+
+function appendRow(name, obj, headers) {
+  const sh = sheetGet(name);
+  if (!headers) headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  sh.appendRow(headers.map(h => (obj[h] !== undefined ? obj[h] : '')));
+  return sh.getLastRow();
+}
+
+// เขียนหลายแถวพร้อมกันในครั้งเดียว (เร็วกว่า appendRow วนลูปหลายรอบมาก)
+function appendRows(name, objs, headers) {
+  if (!objs.length) return;
+  const sh = sheetGet(name);
+  if (!headers) headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const data = objs.map(obj => headers.map(h => (obj[h] !== undefined ? obj[h] : '')));
+  sh.getRange(sh.getLastRow() + 1, 1, data.length, headers.length).setValues(data);
+}
+
+function updateRow(name, rowNumber, obj) {
+  const sh = sheetGet(name);
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  headers.forEach((h, i) => {
+    if (obj[h] !== undefined) sh.getRange(rowNumber, i + 1).setValue(obj[h]);
+  });
+}
+
+// เพิ่มคอลัมน์ (header) ที่ยังไม่มีในชีท เพื่อรองรับฟีเจอร์ใหม่โดยไม่ต้องรัน setup ใหม่ (self-healing)
+function ensureColumns(sheetName, cols) {
+  const sh = sheetGet(sheetName);
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const missing = cols.filter(c => headers.indexOf(c) === -1);
+  if (missing.length) {
+    sh.getRange(1, lastCol + 1, 1, missing.length).setValues([missing]).setFontWeight('bold');
+  }
+}
+
+/**
+ * บังคับให้คอลัมน์ที่ระบุ (เช่น เบอร์โทร, เลขบัตรประชาชน) เป็น Plain Text เสมอ ทั้งคอลัมน์
+ * (ไม่ใช่แค่แถวเดียว) ป้องกัน Google Sheets ตีความค่าที่ขึ้นต้นด้วยเลข 0 เป็นตัวเลขแล้วตัด 0 ทิ้ง
+ * ต้องตั้ง format เป็น Text "ก่อน" ค่าจะถูกเขียนลงไป ถึงจะกันเลข 0 หน้าไม่ให้หายได้ผลจริง
+ * เรียกทุกครั้งก่อน appendRow เพื่อ self-heal แม้ยังไม่ได้รัน setupSpreadsheet ใหม่
+ */
+function ensureTextColumns(sheetName, cols) {
+  const sh = sheetGet(sheetName);
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const maxRows = sh.getMaxRows();
+  cols.forEach(colName => {
+    const idx = headers.indexOf(colName);
+    if (idx === -1) return;
+    sh.getRange(2, idx + 1, Math.max(maxRows - 1, 1), 1).setNumberFormat('@');
+  });
+}
+
+/**
+ * จัดรูปแบบเบอร์โทรให้มีขีด "-" คั่น (เช่น 081-845-7798) ก่อนบันทึกลงชีทเสมอ
+ * เหตุผล: setNumberFormat('@') (Plain Text) ที่ใช้ใน ensureTextColumns() ป้องกันเลข 0 นำหน้าหายได้ไม่ 100%
+ * เสมอไป (เป็น known quirk ของ Sheets API - ตั้ง format ไว้ก่อนเขียนแล้วบางครั้ง Sheets ก็ยัง auto-detect
+ * ค่าที่ "หน้าตาเหมือนตัวเลขล้วนๆ" แล้วแปลงเป็น Number อยู่ดี) การใส่ขีดลงไปในค่าจริงๆ ทำให้ค่านั้น "ไม่เหมือน
+ * ตัวเลขล้วน" อีกต่อไป Sheets จึงไม่มีทางตีความเป็น Number ได้ไม่ว่า number format จะตั้งไว้อย่างไร
+ * รองรับเบอร์มือถือ 10 หลัก (0XX-XXX-XXXX) และเบอร์บ้าน กทม. 9 หลัก (0X-XXX-XXXX) เป็นหลัก
+ * ถ้าจำนวนหลักไม่ตรงรูปแบบที่รู้จัก คืนค่าตัวเลขดิบไปตรงๆ (ไม่พยายามเดารูปแบบผิดๆ)
+ */
+function formatThaiPhone(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length === 10) return digits.slice(0, 3) + '-' + digits.slice(3, 6) + '-' + digits.slice(6);
+  if (digits.length === 9) return digits.slice(0, 2) + '-' + digits.slice(2, 5) + '-' + digits.slice(5);
+  return digits;
+}
+
+function logAction(username, action, detail) {
+  try {
+    appendRow(SHEET_LOG, { DateTime: new Date(), Username: username || '-', Action: action, Detail: detail || '' });
+  } catch (err) { /* ignore logging errors */ }
+}
+
+function genId(prefix) {
+  const now = new Date();
+  const ymd = Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyMMdd');
+  // สุ่ม 6 หลัก (900,000 ค่าที่เป็นไปได้ต่อวัน) แทนของเดิม 4 หลัก (9,000 ค่า) ลดโอกาสสุ่มชนกันลงมาก
+  // (ของเดิมมีโอกาสชนสูงเกินคาดเมื่อมีจำนวนคำสั่งจองต่อวันมาก - ตาม birthday paradox แค่ ~95 รายการ/วัน
+  // ก็มีโอกาสชนถึง 50% แล้ว เพราะไม่เคยเช็คซ้ำกับของเดิมในชีทเลย)
+  const rand = Math.floor(100000 + Math.random() * 900000);
+  return prefix + '-' + ymd + '-' + rand;
+}
+
+/**
+ * สร้าง OrderID ที่การันตีไม่ซ้ำจริง (ไม่ใช่แค่สุ่มเฉยๆ แบบ genId เดิม) - เช็คกับ OrderID ที่มีอยู่แล้วในชีท Orders
+ * ทุกครั้งก่อนใช้งานจริง และครอบด้วย LockService กันปัญหา 2 คำขอที่เข้ามาพร้อมกันสุ่มได้เลขเดียวกัน
+ * แล้วต่างฝ่ายต่างเช็คผ่านพร้อมกันทั้งคู่ (เพราะยังไม่มีใครบันทึกจริงตอนที่อีกฝ่ายเช็ค)
+ */
+function genUniqueOrderId() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const { rows } = readTable(SHEET_ORDERS);
+    const existing = new Set(rows.map(o => o.OrderID));
+    let candidate;
+    let attempts = 0;
+    do {
+      candidate = genId('ORD');
+      attempts++;
+    } while (existing.has(candidate) && attempts < 20);
+    return candidate;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function simpleHash(str) {
+  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, str));
+}
+
+function getOrCreateFolder(name) {
+  const folders = DriveApp.getFoldersByName(name);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(name);
+}
+
+function saveFile(base64Data, fileName, mimeType, folderName) {
+  const folder = getOrCreateFolder(folderName);
+  const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, fileName);
+  const file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return file.getUrl();
+}
+
+/*************************************************************
+ * AUTHENTICATION / AUTHORIZATION
+ * -----------------------------------------------------------
+ * ระบบสิทธิ์จริงอยู่ตรงนี้ทั้งหมด: หลัง login สำเร็จ เซิร์ฟเวอร์จะ
+ * ออก session token แบบสุ่ม (UUID) เก็บไว้ใน CacheService (อายุ 6 ชม.)
+ * ผูกกับ username+permission(role)+unitName แล้วส่ง token กลับไปให้
+ * หน้าเว็บเก็บไว้ ทุกฟังก์ชันที่แตะข้อมูล ต้องได้รับ token ที่ยังไม่
+ * หมดอายุมาด้วย ไม่เช่นนั้นจะถูกปฏิเสธ แม้ว่าชื่อฟังก์ชันจะเรียกจาก
+ * console ตรงๆ ได้ก็ตาม
+ *
+ * Role ที่รองรับ (fixed - ไม่ใช่ menu permission ที่ config เอง):
+ *   SuperAdmin - ทำได้ทุกอย่างในระบบ เห็นทุกหน่วยงาน + เมนูปรับเปลี่ยนขนาดเสื้อ
+ *   Central    - (ส่วนกลาง) ขายให้บุคคล/หน่วยงานได้, ตั้งยอด Staff Order,
+ *                รับ Donate, จัดการ stock ของ Patrunning, ดู stock+report
+ *                ได้ทุกหน่วย เห็น order ทุกหน่วย
+ *   Branch     - (หน่วยขาย) บันทึกจองได้เฉพาะ General Sales ของหน่วยตนเอง
+ *                เห็นเฉพาะ order ของหน่วยตนเอง ดู stock/report ไม่ได้
+ *************************************************************/
+function createSessionToken(username, permission, unitName) {
+  const token = Utilities.getUuid();
+  cacheGet().put('sess_' + token, JSON.stringify({ username, permission, unitName }), SESSION_TTL);
+  return token;
+}
+
+function requireAuth(token, requiredPermission) {
+  if (!token) throw new Error('กรุณาเข้าสู่ระบบก่อนใช้งาน');
+  const raw = cacheGet().get('sess_' + token);
+  if (!raw) throw new Error('เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่');
+  const session = JSON.parse(raw);
+  if (requiredPermission) {
+    const allowed = Array.isArray(requiredPermission) ? requiredPermission : [requiredPermission];
+    if (allowed.indexOf(session.permission) === -1) {
+      throw new Error('คุณไม่มีสิทธิ์ใช้งานฟังก์ชันนี้ (ต้องเป็น ' + allowed.join('/') + ')');
+    }
+  }
+  return session;
+}
+
+function isBackoffice(permission) {
+  return ROLES_BACKOFFICE.indexOf(permission) !== -1;
+}
+
+// migrate ค่า Permission แบบเดิม (Admin/Staff) ให้เป็น role ใหม่แบบอัตโนมัติ เผื่อชีทยังไม่ได้อัปเดต
+// migrate ค่า Permission แบบเดิม (Admin) ให้เป็น role ใหม่แบบอัตโนมัติ เผื่อชีทยังไม่ได้อัปเดต
+// หมายเหตุสำคัญ: เดิมค่า 'Staff' เคย map ไป Branch (สมัยระบบ 2 role Admin/Staff) แต่ตอนนี้ 'Staff' เป็น role ใหม่จริงๆ
+// (เห็นเฉพาะ order channel Staff) แล้ว เอา mapping เก่านั้นออก - ถ้ามี user เก่าที่ Permission ยังเป็น 'Staff'
+// ค้างจากระบบเดิม (หมายถึง Branch) จะถูกตีความเป็น role Staff ใหม่แทน ต้องเข้าไปแก้ในชีท Users ให้ตรงเอง
+function normalizeRole(permission) {
+  if (permission === 'Admin') return ROLE_SUPERADMIN;
+  if (ALL_ROLES.indexOf(permission) !== -1) return permission;
+  return ROLE_BRANCH;
+}
+
+function login(username, password) {
+  const { rows } = readTable(SHEET_USERS);
+  const user = rows.find(u => String(u.Username).trim() === String(username).trim());
+  if (!user) return safeJson({ ok: false, message: 'ไม่พบชื่อผู้ใช้งาน' });
+  if (String(user.Status).toLowerCase() !== 'active') return safeJson({ ok: false, message: 'บัญชีนี้ถูกระงับการใช้งาน (Inactive)' });
+  if (String(user.PasswordHash) !== simpleHash(password)) return safeJson({ ok: false, message: 'รหัสผ่านไม่ถูกต้อง' });
+  updateRow(SHEET_USERS, user._row, { LastLogin: new Date() });
+  logAction(username, 'LOGIN', '');
+  const role = normalizeRole(user.Permission);
+  const token = createSessionToken(user.Username, role, user.UnitName);
+  return safeJson({
+    ok: true,
+    token: token,
+    user: { username: user.Username, name: user.Name, surname: user.Surname, unitName: user.UnitName, permission: role }
+  });
+}
+
+/*************************************************************
+ * UNITS (หน่วยขาย)
+ *************************************************************/
+// รายชื่อหน่วยขายทั้งหมด (ไม่กรอง role) - cache ไว้ 5 นาทีเพราะเปลี่ยนไม่บ่อย ลด round-trip อ่านชีทซ้ำๆ ทุกครั้งที่เปิดฟอร์ม
+function getAllUnitsCached() {
+  const cached = cacheGet().get('unitsList');
+  if (cached) return JSON.parse(cached);
+  const { rows } = readTable(SHEET_UNITS);
+  const units = rows.filter(u => u.Status !== 'Inactive').map(u => ({ unitName: u.UnitName, channel: u.Channel, unitCode: u.UnitCode || '' }));
+  cacheGet().put('unitsList', JSON.stringify(units), UNITS_CACHE_TTL);
+  return units;
+}
+function getUnits(token) {
+  const session = requireAuth(token);
+  let units = getAllUnitsCached();
+  // Branch เห็นเฉพาะหน่วยงานของตัวเอง (ใช้เลือกในฟอร์มจองได้เฉพาะหน่วยตนเอง)
+  if (session.permission === ROLE_BRANCH) {
+    units = units.filter(u => u.unitName === session.unitName);
+  }
+  return safeJson(units);
+}
+// รายชื่อหน่วยขายทั้งหมดพร้อมสถานะ สำหรับหน้าจัดการหน่วยขาย (SuperAdmin เท่านั้น)
+function getUnitsAdmin(token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  ensureColumns(SHEET_UNITS, ['UnitCode']);
+  const { rows } = readTable(SHEET_UNITS);
+  return safeJson(rows.map(u => ({ unitName: u.UnitName, channel: u.Channel, unitCode: u.UnitCode || '', status: u.Status })));
+}
+function addUnit(unitName, channel, unitCode, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  const { rows } = readTable(SHEET_UNITS);
+  if (rows.some(u => u.UnitName === unitName)) return safeJson({ ok: false, message: 'มีหน่วยขายนี้อยู่แล้ว' });
+  ensureColumns(SHEET_UNITS, ['UnitCode']);
+  appendRow(SHEET_UNITS, { UnitName: unitName, Channel: channel, UnitCode: unitCode || '', Status: 'Active' });
+  clearUnitsCache();
+  logAction(username, 'ADD_UNIT', unitName + ' / ' + channel + ' / รหัส ' + unitCode);
+  return safeJson({ ok: true });
+}
+// ตั้ง/แก้รหัสหน่วยขาย (2 หลัก ใช้เป็น 2 หลักแรกของ Ref.1) - SuperAdmin เท่านั้น
+function setUnitCode(unitName, unitCode, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  const code = String(unitCode || '').trim();
+  if (!/^\d{1,3}$/.test(code)) return safeJson({ ok: false, message: 'รหัสหน่วยขายต้องเป็นตัวเลข 1-3 หลัก' });
+  const codePadded = code.padStart(3, '0');
+  const { rows } = readTable(SHEET_UNITS);
+  const dup = rows.find(u => u.UnitName !== unitName && String(u.UnitCode || '').padStart(3, '0') === codePadded);
+  if (dup) return safeJson({ ok: false, message: 'รหัส "' + codePadded + '" ถูกใช้กับหน่วยขาย "' + dup.UnitName + '" ไปแล้ว' });
+  const u = rows.find(x => x.UnitName === unitName);
+  if (!u) return safeJson({ ok: false, message: 'ไม่พบหน่วยขาย' });
+  ensureColumns(SHEET_UNITS, ['UnitCode']);
+  updateRow(SHEET_UNITS, u._row, { UnitCode: codePadded });
+  clearUnitsCache();
+  logAction(username, 'SET_UNIT_CODE', unitName + ' -> ' + codePadded);
+  return safeJson({ ok: true });
+}
+
+/*************************************************************
+ * STOCK
+ * -----------------------------------------------------------
+ * สถานะสต็อกแสดง 4 สีตามกฎ:
+ *   blue   - ยังไม่ถูกขายเลย (sold = 0) หรือส่วนคงเหลือที่ยังไม่ถึง buffer
+ *   green  - ส่วนที่ขายไปแล้ว (sold portion)
+ *   yellow - เมื่อคงเหลือ (remaining) ลดลงจนแตะ/ต่ำกว่า buffer stock (จำนวนเสื้อตายตัว ไม่ใช่ % แล้ว) แต่ยังไม่ติดลบ
+ *   red    - เกิด overbooking (ขายเกินยอดคงเหลือ ตัดสต็อกติดลบ)
+ * รองรับ Overbooking: ไม่บล็อกการจองแม้สต็อกไม่พอ เพื่อให้เห็น demand จริง
+ *************************************************************/
+function computeStockSummary() {
+  const { rows: roundItems } = readTable(SHEET_ROUND_ITEMS);
+  const { rows: orderItems } = readTable(SHEET_ORDER_ITEMS);
+  const { rows: orders } = readTable(SHEET_ORDERS);
+  const alertQty = getStockAlertQty(); // จำนวนเสื้อ (ตัว) ไม่ใช่ % แล้ว ตามที่ปรับ
+
+  const orderStatusById = {};
+  orders.forEach(o => orderStatusById[o.OrderID] = o.PaymentStatus);
+
+  const totalMap = {}, soldMap = {};
+  SIZES.forEach(sz => { totalMap[sz] = 0; soldMap[sz] = 0; });
+
+  roundItems.forEach(ri => { if (totalMap[ri.Size] !== undefined) totalMap[ri.Size] += Number(ri.Qty || 0); });
+  orderItems.forEach(oi => {
+    const status = orderStatusById[oi.OrderID];
+    if (status && status !== 'Cancel' && soldMap[oi.Size] !== undefined) soldMap[oi.Size] += 1;
+  });
+
+  return SIZES.map(sz => {
+    const total = totalMap[sz], sold = soldMap[sz], remaining = total - sold;
+    const bufferQty = alertQty; // เกณฑ์เตือนเป็นจำนวนเสื้อตายตัว ใช้ค่าเดียวกันทุกไซส์
+    const remainingPct = total > 0 ? Math.round((remaining / total) * 100) : 0;
+    const overbooked = remaining < 0;
+    const overbookQty = overbooked ? Math.abs(remaining) : 0;
+
+    let status;
+    if (overbooked) status = 'red';
+    else if (sold === 0) status = 'blue';
+    else if (total > 0 && remaining <= bufferQty) status = 'yellow';
+    else status = 'green'; // มีทั้งส่วนขายแล้ว (เขียว) และคงเหลือปกติ (ฟ้า) แสดงเป็น stacked bar ฝั่ง client
+
+    return {
+      size: sz, total, sold, remaining, remainingPct,
+      bufferQty, overbooked, overbookQty, status,
+      danger: total > 0 && remaining <= alertQty, alertQty
+    };
+  });
+}
+
+function getStockSummary(token) {
+  requireAuth(token);
+  const cached = cacheGet().get('stockSummary');
+  if (cached) return JSON.parse(cached);
+  const data = computeStockSummary();
+  cacheGet().put('stockSummary', JSON.stringify(data), CACHE_TTL);
+  return safeJson(data);
+}
+
+function getStockRounds(token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const { rows } = readTable(SHEET_ROUNDS);
+  const { rows: items } = readTable(SHEET_ROUND_ITEMS);
+  // จัดกลุ่มรายการไซส์ตามรอบ ในคำเดียว (ไม่ query แยกทีละรอบ กันยิง request ซ้ำเยอะเกินไป)
+  const itemsByRound = {};
+  items.forEach(i => {
+    if (!itemsByRound[i.RoundID]) itemsByRound[i.RoundID] = [];
+    itemsByRound[i.RoundID].push({ size: i.Size, qty: Number(i.Qty || 0) });
+  });
+  const withItems = rows.map(r => ({ ...r, sizeItems: itemsByRound[r.RoundID] || [] }));
+  return safeJson(withItems.sort((a, b) => new Date(b.CreatedDate) - new Date(a.CreatedDate)));
+}
+
+function getStockRoundDetail(roundId, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const { rows } = readTable(SHEET_ROUND_ITEMS);
+  return safeJson(rows.filter(r => r.RoundID === roundId));
+}
+
+/**
+ * payload: { roundName, items: [{size, qty, cost}], fileBase64, fileName, mimeType, username }
+ */
+function createStockRound(payload, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const { roundName, items, fileBase64, fileName, mimeType, username } = payload;
+  if (!items || !items.length) return safeJson({ ok: false, message: 'ไม่มีรายการสินค้า' });
+
+  const roundId = genId('RND');
+  let fileUrl = '';
+  if (fileBase64) fileUrl = saveFile(fileBase64, fileName, mimeType, 'ShirtOrder_StockDocs');
+
+  const totalQty = items.reduce((s, i) => s + Number(i.qty), 0);
+  const totalCost = items.reduce((s, i) => s + Number(i.qty) * Number(i.cost || 0), 0);
+
+  appendRow(SHEET_ROUNDS, {
+    RoundID: roundId, RoundName: roundName, CreatedDate: new Date(), CreatedBy: username,
+    AttachmentURL: fileUrl, TotalQty: totalQty, TotalCost: totalCost
+  });
+  appendRows(SHEET_ROUND_ITEMS, items.map(i => ({
+    RoundID: roundId, Size: i.size, Qty: Number(i.qty), CostPerUnit: Number(i.cost || 0), Subtotal: Number(i.qty) * Number(i.cost || 0)
+  })));
+
+  clearCache();
+  logAction(username, 'ADD_STOCK_ROUND', roundName + ' (' + totalQty + ' ชิ้น)');
+  return safeJson({ ok: true, roundId });
+}
+
+/**
+ * ปรับยอดสต็อกรายไซส์โดยตรง (แก้ไขยอดที่คำนวณผิด/ไม่ตรงของจริง) - บันทึกเป็นส่วนต่าง (delta) ลงในกลไก
+ * "รอบนำเข้าสต็อก" เดิม (SHEET_ROUNDS/SHEET_ROUND_ITEMS) เพื่อให้ปรากฏในตารางประวัติรอบนำเข้าเป็น audit trail
+ * โดยอัตโนมัติ พร้อมบันทึกลง log กลางของระบบอีกชั้นด้วย (ประวัติการใช้งาน)
+ */
+function adjustStock(size, newQty, reason, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  if (SIZES.indexOf(size) === -1) return safeJson({ ok: false, message: 'ไซส์ไม่ถูกต้อง' });
+  const newQtyNum = Number(newQty);
+  if (isNaN(newQtyNum) || newQtyNum < 0) return safeJson({ ok: false, message: 'จำนวนต้องเป็นตัวเลขไม่ติดลบ' });
+  if (!reason || !String(reason).trim()) return safeJson({ ok: false, message: 'กรุณาระบุเหตุผลในการปรับยอด (สำหรับ audit log)' });
+
+  const current = computeStockSummary().find(s => s.size === size);
+  const currentTotal = current ? current.total : 0;
+  const delta = newQtyNum - currentTotal;
+  if (delta === 0) return safeJson({ ok: false, message: 'ยอดใหม่เท่ากับยอดเดิม (' + currentTotal + ') ไม่มีอะไรต้องปรับ' });
+
+  const roundId = genId('RND');
+  const roundName = 'ปรับปรุงยอดสต็อก [' + size + '] ' + currentTotal + ' -> ' + newQtyNum + ' (' + String(reason).trim() + ')';
+  appendRow(SHEET_ROUNDS, {
+    RoundID: roundId, RoundName: roundName, CreatedDate: new Date(), CreatedBy: username,
+    AttachmentURL: '', TotalQty: delta, TotalCost: 0
+  });
+  appendRow(SHEET_ROUND_ITEMS, { RoundID: roundId, Size: size, Qty: delta, CostPerUnit: 0, Subtotal: 0 });
+
+  clearCache();
+  logAction(username, 'ADJUST_STOCK', size + ': ' + currentTotal + ' -> ' + newQtyNum + ' (delta ' + (delta > 0 ? '+' : '') + delta + ') เหตุผล: ' + String(reason).trim());
+  return safeJson({ ok: true, oldTotal: currentTotal, newTotal: newQtyNum, delta: delta });
+}
+
+/*************************************************************
+ * SETTINGS
+ *************************************************************/
+function getSettingValue(key, defaultVal) {
+  const { rows } = readTable(SHEET_SETTINGS);
+  const row = rows.find(r => r.Key === key);
+  return row ? row.Value : defaultVal;
+}
+function setSettingValue(key, value) {
+  const { rows } = readTable(SHEET_SETTINGS);
+  const row = rows.find(r => r.Key === key);
+  if (row) updateRow(SHEET_SETTINGS, row._row, { Value: value });
+  else appendRow(SHEET_SETTINGS, { Key: key, Value: value });
+}
+function getStockAlertQty() { return Number(getSettingValue('StockAlertQty', 20)); }
+function setStockAlertQty(qty, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  setSettingValue('StockAlertQty', Number(qty));
+  clearCache();
+  logAction(username, 'SET_ALERT_QTY', String(qty));
+  return safeJson({ ok: true });
+}
+
+// ราคาเสื้อตามระยะวิ่ง (บาท/ตัว) - ใช้เป็นค่า default ตอนเพิ่มรายการในคำสั่งจอง
+// แก้ไขได้จุดเดียวที่นี่ การแก้ราคาจะกระทบเฉพาะ Order ที่สร้างใหม่เท่านั้น (Order เดิมไม่เปลี่ยน)
+function getDefaultShirtPrice(token) {
+  requireAuth(token);
+  return safeJson({
+    defaultPrice: Number(getSettingValue('DefaultShirtPrice', 300)), // ราคาสำรอง เผื่อไม่ระบุระยะ
+    priceByDistance: {
+      '5กม.': Number(getSettingValue('Price5KM', 500)),
+      '10กม.': Number(getSettingValue('Price10KM', 600))
+    }
+  });
+}
+function setDefaultShirtPrice(price, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  setSettingValue('DefaultShirtPrice', Number(price) || 0);
+  logAction(username, 'SET_DEFAULT_PRICE', String(price));
+  return safeJson({ ok: true });
+}
+// ตั้งราคาตามระยะวิ่ง (มี warning ฝั่ง client ก่อนเรียกฟังก์ชันนี้ตามที่ตกลง)
+function setDistancePrices(price5km, price10km, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  setSettingValue('Price5KM', Number(price5km) || 0);
+  setSettingValue('Price10KM', Number(price10km) || 0);
+  logAction(username, 'SET_DISTANCE_PRICE', '5กม.=' + price5km + ' / 10กม.=' + price10km);
+  return safeJson({ ok: true });
+}
+
+function getCutoffTime() { return String(getSettingValue('CutoffTime', '23:30')); }
+function setCutoffTime(hhmm, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  setSettingValue('CutoffTime', String(hhmm || '23:30'));
+  logAction(username, 'SET_CUTOFF_TIME', String(hhmm));
+  return safeJson({ ok: true });
+}
+
+/*************************************************************
+ * PAYIN / REF1-REF2 (สำหรับใบแจ้งความประสงค์ + Pay-in Slip)
+ * -----------------------------------------------------------
+ * Ref.1 (10 หลัก) = 9 หลักที่ระบบสร้างเอง + Check digit 1 หลัก
+ *   หลัก 1-2: รหัสหน่วยขาย (ตั้งค่าต่อหน่วยได้ที่หน้าจัดการหน่วยขาย)
+ *   หลัก 3-5: Julian date ของปีที่ขาย (วันที่ 1 ม.ค. = 001)
+ *   หลัก 6-9: เวลาที่สร้างคำสั่งจอง HHMM (24 ชม.)
+ * Ref.2 (8 หลัก) = วันที่ครบกำหนดชำระ รูปแบบ YYYYMMDD (พ.ศ.)
+ * Check digit คำนวณจาก Ref.1(9)+Ref.2(8)+Comp Code(5) ด้วยสูตร weighted-sum + MOD9
+ * (สูตรและตัวอย่างยืนยันตรงกับเอกสารที่ได้รับ: 531910001+25690915+97386 -> check digit 2)
+ *************************************************************/
+function getCompCode() { return String(getSettingValue('CompCode', '97386')); }
+function setCompCode(code, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  setSettingValue('CompCode', String(code || ''));
+  logAction(username, 'SET_COMP_CODE', String(code));
+  return safeJson({ ok: true });
+}
+
+function getTaxId() { return String(getSettingValue('CGDTaxID', '0994000159510')); }
+
+function getBillerId() { return String(getSettingValue('BillerID', '099400015951040')); }
+function setBillerId(id, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  setSettingValue('BillerID', String(id || ''));
+  logAction(username, 'SET_BILLER_ID', String(id));
+  return safeJson({ ok: true });
+}
+function getProjectName() { return String(getSettingValue('ProjectName', 'จัดเดิน-วิ่ง "กรมบัญชีกลาง มินิมาราธอน"')); }
+function setProjectName(name, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  setSettingValue('ProjectName', String(name || ''));
+  logAction(username, 'SET_PROJECT_NAME', String(name));
+  return safeJson({ ok: true });
+}
+function getPayinSettings(token) {
+  requireAuth(token);
+  return safeJson({ compCode: getCompCode(), billerId: getBillerId(), projectName: getProjectName(), taxID: getTaxId() });
+}
+
+function weightedDigitSum(digitsStr, weights) {
+  let sum = 0;
+  for (let i = 0; i < digitsStr.length; i++) sum += Number(digitsStr[i]) * weights[i];
+  return sum;
+}
+// คืนค่า check digit (1-9) จาก BookingNo/Ref.1 ฐาน(10 หลัก) + Ref.2(8 หลัก) + Comp Code(5 หลัก)
+// weight ของหลักที่ 10 = 1 (วนกลับมาเริ่มจากจุดเดิมของ pattern 1,3,5,7,9,2,4,6,8) - ยืนยันจากสูตรจริงแล้ว
+function computeThaiPayinCheckDigit(ref1Ten, ref2Eight, compCode5) {
+  const w1 = [1, 3, 5, 7, 9, 2, 4, 6, 8, 1];
+  const w2 = [1, 2, 3, 4, 5, 6, 7, 8];
+  const w3 = [2, 4, 6, 8, 9];
+  const r1 = weightedDigitSum(ref1Ten, w1);
+  const r2 = weightedDigitSum(ref2Eight, w2);
+  const r3 = weightedDigitSum(compCode5, w3);
+  const total = r1 + r2 + r3;
+  const mod = total % 9;
+  return 9 - mod; // 1-9
+}
+function julianDayOfYear(date) {
+  const start = new Date(date.getFullYear(), 0, 1);
+  const diff = Math.floor((date - start) / 86400000) + 1;
+  return ('00' + diff).slice(-3);
+}
+function toBuddhistYYYYMMDD(date) {
+  const be = date.getFullYear() + 543;
+  const mm = ('0' + (date.getMonth() + 1)).slice(-2);
+  const dd = ('0' + date.getDate()).slice(-2);
+  return String(be) + mm + dd;
+}
+/**
+ * สร้าง "เลขที่ใบจอง" (BookingNo, 10 หลัก) - เกิดก่อนเสมอ ไม่มี check digit ของตัวเอง
+ *   หลัก 1-3: รหัสหน่วยขาย (3 หลัก ตามชีท Units), หลัก 4-6: Julian date, หลัก 7-10: HHSS (ชั่วโมง+วินาที ที่สร้างคำสั่งจอง)
+ * หมายเหตุ: ชนกันได้ถ้าหน่วยเดียวกันสร้างคำสั่งจอง 2 รายการในชั่วโมงเดียวกัน + วินาทีเดียวกัน (โอกาสต่ำมาก)
+ */
+function generateBookingNo(unitCode, createdDate) {
+  const uc = String(unitCode || '000').slice(0, 3).padStart(3, '0');
+  const jday = julianDayOfYear(createdDate);
+  const hh = ('0' + createdDate.getHours()).slice(-2);
+  const ss = ('0' + createdDate.getSeconds()).slice(-2);
+  return uc + jday + hh + ss; // 3+3+2+2 = 10 หลัก
+}
+/**
+ * สร้าง Ref.1 (11 หลัก) = BookingNo (10 หลัก) + Check digit (1 หลัก)
+ * Check digit คำนวณจาก BookingNo(10) + Ref.2(8) + Comp Code(5) ด้วยสูตร weighted-sum + MOD9
+ * (ยืนยันสูตรตรงกับตัวอย่างจริงแล้ว: 9923809489 + Ref2=25690825 + CompCode=97386 -> check digit 8 -> 99238094898)
+ */
+function generateRef1FromBookingNo(bookingNoTen, ref2Eight, compCode5) {
+  const check = computeThaiPayinCheckDigit(bookingNoTen, ref2Eight, compCode5);
+  return bookingNoTen + String(check);
+}
+
+/*************************************************************
+ * ORDERS
+ *************************************************************/
+// คำนวณเวลาหมดอายุใบจอง = สิ้นสุด ณ เวลา cutoff ของ "วันเดียวกับที่ทำการจอง"
+// ถ้าจองหลัง cutoff ของวันนั้นไปแล้ว (edge case) ให้หมดอายุทันที เพื่อให้ auto-cancel เก็บได้ในรอบถัดไป
+function computeExpireDate(now) {
+  const cutoff = getCutoffTime(); // 'HH:mm'
+  const parts = cutoff.split(':');
+  const h = Number(parts[0]) || 23, m = Number(parts[1]) || 30;
+  const expire = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
+  return expire;
+}
+
+// ตรวจสอบว่าไซส์ที่เลือกอนุญาตสำหรับ channel นี้หรือไม่ (Staff เลือกได้ทุกไซส์ ที่เหลือได้ถึง 5XL เท่านั้น)
+function validateSizesForChannel(channel, sizes) {
+  if (channel === CHANNEL_STAFF) return null;
+  const invalid = sizes.filter(sz => SIZES_PUBLIC.indexOf(sz) === -1);
+  if (invalid.length) {
+    return 'ไซส์ ' + Array.from(new Set(invalid)).join(', ') + ' ใช้ได้เฉพาะการจองประเภท Staff เท่านั้น (ประเภทนี้เลือกได้ถึง 5XL)';
+  }
+  return null;
+}
+
+/**
+ * payload: {
+ *   username, channel ('Standard'|'Patrunning'|'Donate'|'Staff'), unitName,
+ *   paymentStatus ('Paid'|'Waiting'),
+ *   paidAmount, paidDate, paymentFile: {base64,fileName,mimeType} | null,
+ *   payer: { payerType:'Person'|'Company', firstName,lastName,email,phone,idNumber,taxId,companyName,companyAddress },
+ *   items: [ {group, firstName,lastName,age,gender,distance,size,pricePerUnit} ],
+ *   targetUnit: string  // เฉพาะ channel Staff - หน่วยงานในกรมที่จะรับเสื้อไป
+ *   targetUnitCode: string // เฉพาะ channel Staff (ทางเลือก) - รหัสหน่วยงานที่รับเสื้อ ถ้าส่งมาต้องตรงกับ UnitCode ในชีท Units เท่านั้น (กันรหัส/หน่วยงานเพี้ยนจากไฟล์ import)
+ *   donationDetail: string // เฉพาะ channel Donate กรณีเป็นสิ่งของ (ไม่ใช่เงินสด)
+ *   receipt: { wantReceipt: boolean, name, taxId, address, email } // เฉพาะ channel Standard (หน่วยขาย) - ใบเสร็จรับเงินเป็นทางเลือก แต่ถ้า wantReceipt=true ต้องกรอกครบทั้ง 4 ช่อง
+ * }
+ */
+function createOrder(payload, token) {
+  const session = requireAuth(token);
+  const { username, channel, unitName, paymentFile, payer, items, targetUnit, targetUnitCode, donationDetail, receipt } = payload;
+  if (!items || !items.length) return safeJson({ ok: false, message: 'กรุณาเพิ่มรายการอย่างน้อย 1 รายการ' });
+
+  // ต้องกรอกข้อมูลผู้สั่งจองอย่างน้อยชื่อ-สกุล (นิติบุคคลต้องมีชื่อบริษัทด้วย) - เฉพาะ channel ที่มีผู้สั่งจอง (ไม่ใช่ Patrunning/Staff)
+  const needsPayer = channel !== CHANNEL_PATRUNNING && channel !== CHANNEL_STAFF;
+  if (needsPayer) {
+    if (!payer || !String(payer.firstName || '').trim() || !String(payer.lastName || '').trim()) {
+      return safeJson({ ok: false, message: 'กรุณากรอกชื่อ-นามสกุลผู้สั่งจอง' });
+    }
+    // Standard (หน่วยขาย) ไม่ใช้ toggle บุคคล/นิติบุคคลแล้ว ข้าม validation นี้ไป - ใช้ receipt.wantReceipt แทน (เช็คด้านล่าง)
+    if (channel !== CHANNEL_STANDARD && payer.payerType === 'Company' && !String(payer.companyName || '').trim()) {
+      return safeJson({ ok: false, message: 'กรุณากรอกชื่อบริษัท/หน่วยงาน' });
+    }
+  }
+
+  // หน่วยขาย (Standard): ใบเสร็จรับเงินเป็นทางเลือก แต่ถ้าต้องการ (wantReceipt=true) ต้องกรอกครบทั้ง 4 ช่อง - เช็คซ้ำฝั่ง server เสมอ ไม่เชื่อ client เพียงอย่างเดียว
+  let wantReceipt = false, receiptName = '', receiptTaxId = '', receiptAddress = '', receiptEmail = '';
+  if (channel === CHANNEL_STANDARD && receipt && receipt.wantReceipt) {
+    wantReceipt = true;
+    receiptName = String(receipt.name || '').trim();
+    receiptTaxId = String(receipt.taxId || '').trim();
+    receiptAddress = String(receipt.address || '').trim();
+    receiptEmail = String(receipt.email || '').trim();
+    if (!receiptName || !receiptTaxId || !receiptAddress || !receiptEmail) {
+      return safeJson({ ok: false, message: 'กรุณากรอกข้อมูลใบเสร็จรับเงินให้ครบทุกช่อง (ชื่อบนใบเสร็จ, เลขผู้เสียภาษี, ที่อยู่, Email)' });
+    }
+  }
+
+  // Donate: ผู้บริจาคไม่สนใจราคาต่อตัว แต่ต้องระบุยอดเงินบริจาครวมเสมอ (required) - เช็คซ้ำฝั่ง server เสมอ ไม่เชื่อ client เพียงอย่างเดียว
+  if (channel === CHANNEL_DONATE) {
+    const donateAmount = Number(payload.totalAmount || 0);
+    if (!donateAmount || donateAmount <= 0) {
+      return safeJson({ ok: false, message: 'กรุณากรอกยอดเงินบริจาค (จำเป็นต้องระบุ)' });
+    }
+  }
+
+  // Staff Order: สร้างได้เฉพาะ SuperAdmin / Central / Staff role เท่านั้น และต้องระบุหน่วยงานที่จะรับเสื้อ
+  let staffTargetUnit = targetUnit;
+  let staffTargetUnitCode = '';
+  if (channel === CHANNEL_STAFF) {
+    const allowedStaff = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_STAFF];
+    if (allowedStaff.indexOf(session.permission) === -1) {
+      return safeJson({ ok: false, message: 'คุณไม่มีสิทธิ์บันทึกรายการ Staff Order' });
+    }
+    if (!targetUnit) return safeJson({ ok: false, message: 'กรุณาระบุหน่วยงานที่จะรับเสื้อ' });
+    // ถ้ามีการส่งรหัสหน่วยงานมาด้วย (เช่น มาจากการนำเข้าไฟล์โควตา) ต้องตรงกับ UnitCode ในชีท Units เท่านั้น
+    // ไม่เชื่อชื่อ/รหัสจาก client เฉยๆ - เช็คซ้ำฝั่ง server เสมอ กันข้อมูลเพี้ยนหรือถูกปลอมแปลง แล้วใช้ชื่อหน่วยงานจากชีท Units เป็นค่าจริง (canonical)
+    if (targetUnitCode) {
+      const codePadded = String(targetUnitCode).trim().padStart(3, '0');
+      const unitsRowsForCode = readTable(SHEET_UNITS).rows;
+      const matchedUnit = unitsRowsForCode.find(u => String(u.UnitCode || '').padStart(3, '0') === codePadded);
+      if (!matchedUnit) {
+        return safeJson({ ok: false, message: 'ไม่พบรหัสหน่วยงาน "' + codePadded + '" ในชีท Units กรุณาตรวจสอบรหัสหน่วยงานให้ถูกต้อง' });
+      }
+      staffTargetUnit = matchedUnit.UnitName;
+      staffTargetUnitCode = codePadded;
+    }
+  } else {
+    if (!unitName) return safeJson({ ok: false, message: 'กรุณาเลือกหน่วยขาย' });
+    // Branch บันทึกได้เฉพาะหน่วยงานของตัวเอง และเฉพาะ General Sales (Standard)
+    if (session.permission === ROLE_BRANCH) {
+      if (channel !== CHANNEL_STANDARD) {
+        return safeJson({ ok: false, message: 'หน่วยขายบันทึกได้เฉพาะประเภท "ขายผ่านหน่วยขาย (General Sales)" เท่านั้น' });
+      }
+      if (unitName !== session.unitName) {
+        return safeJson({ ok: false, message: 'หน่วยขายบันทึกรายการให้หน่วยงานอื่นไม่ได้' });
+      }
+    }
+    // Standard: เฉพาะ SuperAdmin/Central/Branch (Patrunning-Donate role ทำไม่ได้)
+    if (channel === CHANNEL_STANDARD) {
+      const allowedStandard = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_BRANCH];
+      if (allowedStandard.indexOf(session.permission) === -1) {
+        return safeJson({ ok: false, message: 'คุณไม่มีสิทธิ์บันทึกรายการขายผ่านหน่วยขาย' });
+      }
+    }
+    // Patrunning: เฉพาะ SuperAdmin/Central/Patrunning role
+    if (channel === CHANNEL_PATRUNNING) {
+      const allowedPat = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_PATRUNNING];
+      if (allowedPat.indexOf(session.permission) === -1) {
+        return safeJson({ ok: false, message: 'คุณไม่มีสิทธิ์บันทึกรายการขายผ่านตัวแทน (Patrunning)' });
+      }
+    }
+    // Donate: เฉพาะ SuperAdmin/Central/Donate role
+    if (channel === CHANNEL_DONATE) {
+      const allowedDonate = [ROLE_SUPERADMIN, ROLE_CENTRAL, ROLE_DONATE];
+      if (allowedDonate.indexOf(session.permission) === -1) {
+        return safeJson({ ok: false, message: 'คุณไม่มีสิทธิ์บันทึกรายการ Donate/Sponsor' });
+      }
+    }
+  }
+
+  // รองรับคอลัมน์ที่เพิ่มใหม่โดยไม่ต้องรัน setup ใหม่
+  ensureColumns(SHEET_ORDERS, ['Title', 'TargetUnit', 'TargetUnitCode', 'DonationDetail', 'WantReceipt', 'ReceiptName', 'ReceiptTaxID', 'ReceiptAddress', 'ReceiptEmail']);
+  // ป้องกันเบอร์โทร/เลขบัตรที่ขึ้นต้นด้วย 0 ถูกตัดทิ้ง ต้องตั้ง format เป็นข้อความก่อนเขียนค่า
+  ensureTextColumns(SHEET_ORDERS, ['Phone', 'IdNumber', 'TaxID', 'ReceiptTaxID']);
+
+  // ตรวจสอบไซส์ที่เลือกให้ตรงข้อจำกัดของ channel
+  const sizeError = validateSizesForChannel(channel, items.map(i => i.size));
+  if (sizeError) return safeJson({ ok: false, message: sizeError });
+
+  // ตรวจสอบสต็อก - ไม่บล็อกการจองอีกต่อไป (รองรับ Overbooking) แต่แจ้งเตือนกลับไปให้ผู้ใช้ทราบ
+  const stock = computeStockSummary();
+  const neededBySize = {};
+  items.forEach(i => { neededBySize[i.size] = (neededBySize[i.size] || 0) + 1; });
+  const overbookWarnings = [];
+  for (const size in neededBySize) {
+    const s = stock.find(x => x.size === size);
+    const remaining = s ? s.remaining : 0;
+    if (remaining < neededBySize[size]) {
+      overbookWarnings.push('ไซส์ ' + size + ' คงเหลือ ' + remaining + ' แต่จองไป ' + neededBySize[size] + ' (เกินสต็อก ' + (neededBySize[size] - remaining) + ' ตัว)');
+    }
+  }
+
+  const orderId = genUniqueOrderId();
+  const now = new Date();
+  const totalQty = items.length;
+  const isStaffOrDonateNoPay = channel === CHANNEL_STAFF; // Staff ไม่มีการชำระเงินเลย (ไม่มีจำนวนเงิน ไม่มีผู้สั่งจอง)
+  const isNoPayin = channel === CHANNEL_PATRUNNING || channel === CHANNEL_DONATE || channel === CHANNEL_STAFF; // ไม่ออกใบ Payin
+
+  // ราคาต่อชิ้นล็อกตามระยะวิ่งเสมอ (ไม่เชื่อค่าที่ client ส่งมา ป้องกันการปลอมแปลงราคา) - Staff ไม่มีราคา (0 เสมอ)
+  const priceByDistance = { '5กม.': Number(getSettingValue('Price5KM', 500)), '10กม.': Number(getSettingValue('Price10KM', 600)) };
+  items.forEach(i => {
+    i.pricePerUnit = isStaffOrDonateNoPay ? 0 : (priceByDistance[i.distance] != null ? priceByDistance[i.distance] : Number(i.pricePerUnit || 0));
+  });
+
+  // ยอดรวมที่คำนวณจากราคาต่อชิ้นที่ล็อกไว้แล้วข้างต้น
+  // Standard (ขายผ่านหน่วย) ห้ามปรับยอดรวมเอง ต้องเท่ากับผลรวมราคาที่ล็อกไว้เท่านั้น (ป้องกันการปลอมแปลงฝั่ง client ด้วย)
+  // Donate/Patrunning ยังปรับยอดรวมได้ (เช่น มูลค่าของบริจาค หรือราคาตกลงพิเศษกับตัวแทน)
+  const computedAmount = items.reduce((s, i) => s + Number(i.pricePerUnit || 0), 0);
+  const canOverride = channel !== CHANNEL_STANDARD;
+  const hasOverride = canOverride && payload.totalAmount !== undefined && payload.totalAmount !== null && payload.totalAmount !== '';
+  const totalAmount = isStaffOrDonateNoPay ? 0 : (hasOverride ? Number(payload.totalAmount) : computedAmount);
+
+  // สถานะการชำระเงินกำหนดตายตัวตาม channel เสมอ (ไม่พึ่งค่าที่ client ส่งมา ป้องกันการปลอมแปลงฝั่ง client):
+  //   Standard (ขายผ่านหน่วย) ต้องออกใบ Payin เสมอ -> ยังไม่ชำระ (Waiting) เสมอตอนสร้าง
+  //   Patrunning / Donate / Staff -> ถือว่าชำระแล้วเสมอ (ไม่มีใบ Payin ต้องรอ / Donate รับของแทนเงิน / Staff ไม่มีการชำระ)
+  const isPaid = channel !== CHANNEL_STANDARD;
+
+  let paymentFileUrl = '';
+  if (!isStaffOrDonateNoPay && isPaid && paymentFile && paymentFile.base64) {
+    paymentFileUrl = saveFile(paymentFile.base64, paymentFile.fileName, paymentFile.mimeType, 'ShirtOrder_Payments');
+  }
+
+  // เลขที่ใบจอง (BookingNo) สร้างก่อนเสมอ แล้วต่อยอดเป็น Ref.1 โดยเติม check digit
+  // สร้างเฉพาะ channel ที่มีใบ Payin (Standard เท่านั้น ตอนนี้)
+  const expireDateForOrder = (!isStaffOrDonateNoPay && !isPaid) ? computeExpireDate(now) : '';
+  let ref1 = '', ref2 = '', bookingNo = '';
+  if (!isNoPayin) {
+    ensureColumns(SHEET_UNITS, ['UnitCode']);
+    const unitsRows = readTable(SHEET_UNITS).rows;
+    const unitRow = unitsRows.find(u => u.UnitName === unitName);
+    const unitCode = unitRow ? String(unitRow.UnitCode || '000').padStart(3, '0') : '000';
+    ref2 = toBuddhistYYYYMMDD(expireDateForOrder || now);
+    bookingNo = generateBookingNo(unitCode, now);
+    ref1 = generateRef1FromBookingNo(bookingNo, ref2, getCompCode());
+  }
+
+  ensureColumns(SHEET_ORDERS, ['Ref1', 'Ref2', 'BookingNo']);
+  appendRow(SHEET_ORDERS, {
+    OrderID: orderId, CreatedDate: now, CreatedBy: username, Channel: channel,
+    UnitName: channel === CHANNEL_STAFF ? 'ส่วนกลาง' : unitName,
+    TargetUnit: channel === CHANNEL_STAFF ? staffTargetUnit : '',
+    TargetUnitCode: channel === CHANNEL_STAFF ? staffTargetUnitCode : '',
+    DonationDetail: channel === CHANNEL_DONATE ? (donationDetail || '') : '',
+    PayerType: payer ? payer.payerType : '', Title: payer ? (payer.title || '') : '',
+    FirstName: payer ? payer.firstName : '', LastName: payer ? payer.lastName : '',
+    Email: payer ? payer.email : '', Phone: payer ? formatThaiPhone(payer.phone) : '', IdNumber: payer ? payer.idNumber : '',
+    TaxID: payer ? payer.taxId : '', CompanyName: payer ? payer.companyName : '', CompanyAddress: payer ? payer.companyAddress : '',
+    PaymentStatus: isPaid ? 'Paid' : 'Waiting',
+    PaidAmount: isPaid ? Number(totalAmount) : '',
+    PaidDate: isPaid ? now : '',
+    PaymentFileURL: paymentFileUrl,
+    ExpireDate: expireDateForOrder,
+    TotalQty: totalQty, TotalAmount: totalAmount,
+    HasPayin: isNoPayin ? 'N' : 'Y',
+    Ref1: ref1, Ref2: ref2, BookingNo: bookingNo,
+    WantReceipt: channel === CHANNEL_STANDARD ? (wantReceipt ? 'Y' : 'N') : '',
+    ReceiptName: wantReceipt ? receiptName : '',
+    ReceiptTaxID: wantReceipt ? receiptTaxId : '',
+    ReceiptAddress: wantReceipt ? receiptAddress : '',
+    ReceiptEmail: wantReceipt ? receiptEmail : ''
+  });
+
+  ensureColumns(SHEET_ORDER_ITEMS, ['AgeYears']);
+  appendRows(SHEET_ORDER_ITEMS, items.map(i => ({
+    OrderItemID: genId('OI'), OrderID: orderId, ParticipantGroup: i.group || 'เข้าร่วมกิจกรรม',
+    FirstName: i.firstName, LastName: i.lastName, Age: i.age, AgeYears: i.ageYears || '', Gender: i.gender, Distance: i.distance,
+    Size: i.size, PricePerUnit: Number(i.pricePerUnit || 0)
+  })));
+
+  clearCache();
+  logAction(username, 'CREATE_ORDER', `${orderId} (${channel}/${unitName || targetUnit}) ${totalQty} ชิ้น ${totalAmount} บาท` + (overbookWarnings.length ? ' [OVERBOOK]' : ''));
+  return safeJson({ ok: true, orderId, totalQty, totalAmount, isPaid, overbookWarnings });
+}
+
+function getOrders(filter, token) {
+  const session = requireAuth(token);
+  const { rows } = readTable(SHEET_ORDERS);
+  let result = rows;
+  // Branch เห็นเฉพาะ order ของหน่วยตัวเอง / Patrunning-Donate-Staff role เห็นเฉพาะ order ประเภทของตัวเอง (ทุกหน่วย)
+  // ในเมนู "คำสั่งจอง" ปกติ - ส่วนการปรับเปลี่ยนขนาดเสื้อของ order ทุกประเภท Staff role ทำผ่านเมนู "ปรับเปลี่ยนขนาดเสื้อ"
+  // (searchOrdersForSizeRevision) ที่เห็น order ทุกประเภทอยู่แล้วแยกต่างหาก ไม่ต้องเปิดให้เห็นซ้ำในเมนูนี้ด้วย
+  // Central/SuperAdmin เห็นทุกหน่วยทุกประเภท
+  if (session.permission === ROLE_BRANCH) {
+    result = result.filter(o => o.UnitName === session.unitName);
+  } else if (session.permission === ROLE_PATRUNNING) {
+    result = result.filter(o => o.Channel === CHANNEL_PATRUNNING);
+  } else if (session.permission === ROLE_DONATE) {
+    result = result.filter(o => o.Channel === CHANNEL_DONATE);
+  } else if (session.permission === ROLE_STAFF) {
+    result = result.filter(o => o.Channel === CHANNEL_STAFF);
+  }
+  if (filter) {
+    if (filter.paymentStatus) result = result.filter(o => o.PaymentStatus === filter.paymentStatus);
+    if (filter.channel) result = result.filter(o => o.Channel === filter.channel);
+    if (filter.unitName) result = result.filter(o => String(o.UnitName).includes(filter.unitName));
+    if (filter.keyword) {
+      const kw = filter.keyword.toLowerCase();
+      result = result.filter(o =>
+        String(o.OrderID).toLowerCase().includes(kw) ||
+        String(o.FirstName).toLowerCase().includes(kw) ||
+        String(o.LastName).toLowerCase().includes(kw) ||
+        String(o.CompanyName).toLowerCase().includes(kw)
+      );
+    }
+    if (filter.dateFrom) result = result.filter(o => new Date(o.CreatedDate) >= new Date(filter.dateFrom));
+    if (filter.dateTo) {
+      const to = new Date(filter.dateTo);
+      to.setHours(23, 59, 59, 999); // รวมทั้งวันสุดท้ายของช่วงที่เลือก ไม่ตัดที่เที่ยงคืน
+      result = result.filter(o => new Date(o.CreatedDate) <= to);
+    }
+  }
+  return safeJson(result.sort((a, b) => new Date(b.CreatedDate) - new Date(a.CreatedDate)));
+}
+
+/**
+ * ค้นหา order สำหรับหน้า "ปรับเปลี่ยนขนาดเสื้อ" โดยเฉพาะ - ไม่กรองตาม channel/หน่วยงานเหมือน getOrders()
+ * เพราะการปรับไซส์ต้องทำได้กับ order ทุกประเภท (Staff role เห็นแค่ order Staff ใน list ปกติ แต่ต้องเห็นทุก order ตรงนี้)
+ * สิทธิ์เข้าถึงคุมด้วย ROLES_SIZEREVISION (SuperAdmin + Staff role) แทน
+ */
+function searchOrdersForSizeRevision(keyword, token) {
+  requireAuth(token, ROLES_SIZEREVISION);
+  const { rows } = readTable(SHEET_ORDERS);
+  const kw = String(keyword || '').trim().toLowerCase();
+  // ปรับไซส์ทำได้เฉพาะ order ที่ชำระแล้วเท่านั้น (Paid) ไม่ว่าจะค้นด้วยคำค้นหาหรือดูรายการ default ก็ตาม
+  let result = rows.filter(o => o.PaymentStatus === 'Paid');
+  if (kw) {
+    result = result.filter(o =>
+      String(o.OrderID).toLowerCase().includes(kw) ||
+      String(o.FirstName).toLowerCase().includes(kw) ||
+      String(o.LastName).toLowerCase().includes(kw) ||
+      String(o.CompanyName).toLowerCase().includes(kw)
+    );
+  }
+  return safeJson(result.sort((a, b) => new Date(b.CreatedDate) - new Date(a.CreatedDate)));
+}
+
+/**
+ * บันทึกว่ามีคนกดดู/พิมพ์ใบ Payin ของ order นี้แล้ว (แสดง badge สีเขียวที่ปุ่ม Payin ให้ทุกคนเห็นตรงกัน)
+ * ไม่ต้องมีสิทธิ์พิเศษ - แค่ login แล้วก็บันทึกได้ (เหมือนกับที่ดูใบ Payin ได้อยู่แล้ว)
+ */
+function markPayinViewed(orderId, username, token) {
+  requireAuth(token);
+  ensureColumns(SHEET_ORDERS, ['PayinViewedAt', 'PayinViewedBy']);
+  const { rows } = readTable(SHEET_ORDERS);
+  const order = rows.find(o => o.OrderID === orderId);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบคำสั่งจอง' });
+  updateRow(SHEET_ORDERS, order._row, { PayinViewedAt: new Date(), PayinViewedBy: username || '-' });
+  clearCache();
+  return safeJson({ ok: true });
+}
+
+function getOrderDetail(orderId, token) {
+  const session = requireAuth(token);
+  const { rows: orders } = readTable(SHEET_ORDERS);
+  const order = orders.find(o => o.OrderID === orderId);
+  if (!order) return null;
+  if (session.permission === ROLE_BRANCH && order.UnitName !== session.unitName) {
+    throw new Error('คุณไม่มีสิทธิ์ดูคำสั่งจองของหน่วยงานอื่น');
+  }
+  const { rows: items } = readTable(SHEET_ORDER_ITEMS);
+  return safeJson({ order, items: items.filter(i => i.OrderID === orderId) });
+}
+
+function uploadPaymentFile(orderId, base64Data, fileName, mimeType, username, token) {
+  requireAuth(token);
+  const { rows } = readTable(SHEET_ORDERS);
+  const order = rows.find(o => o.OrderID === orderId);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบคำสั่งจอง' });
+  if (order.PaymentStatus === 'Cancel') return safeJson({ ok: false, message: 'คำสั่งจองนี้ถูกยกเลิกแล้ว' });
+
+  const fileUrl = saveFile(base64Data, fileName, mimeType, 'ShirtOrder_Payments');
+  updateRow(SHEET_ORDERS, order._row, {
+    PaymentStatus: 'Paid', PaymentFileURL: fileUrl, PaidDate: new Date(), PaidAmount: order.TotalAmount
+  });
+  clearCache();
+  logAction(username, 'UPLOAD_PAYMENT', orderId);
+  return safeJson({ ok: true, fileUrl });
+}
+
+/**
+ * ยืนยันชำระเงินจากรายการที่ parse ได้จากไฟล์ Payment File ของธนาคาร (D-record)
+ * ผู้ใช้ (Central/SuperAdmin) เป็นคนจับคู่ orderId เองด้วยตา (ดูชื่อ/ยอดเงินเทียบ) เพราะยังไม่มีระบบ
+ * Ref.1 ผูกกับ OrderID โดยอัตโนมัติ (รอออกแบบตอนทำใบ Payin จริง) - ฟังก์ชันนี้จึงไม่ auto-match เอง
+ * เก็บ Ref.1 จากไฟล์ไว้ในคอลัมน์ PaymentRef1 เพื่อตรวจสอบย้อนหลังได้ว่าอ้างอิงจากรายการไหนในไฟล์
+ */
+function confirmPaymentFromFile(orderId, amount, payDateStr, ref1, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const { rows } = readTable(SHEET_ORDERS);
+  const order = rows.find(o => o.OrderID === orderId);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบเลขที่คำสั่งจอง "' + orderId + '"' });
+  if (order.PaymentStatus === 'Cancel') return safeJson({ ok: false, message: 'คำสั่งจองนี้ถูกยกเลิกแล้ว' });
+  if (order.PaymentStatus === 'Paid') return safeJson({ ok: false, message: 'คำสั่งจองนี้ชำระเงินไปแล้ว' });
+
+  ensureColumns(SHEET_ORDERS, ['PaymentRef1']);
+  updateRow(SHEET_ORDERS, order._row, {
+    PaymentStatus: 'Paid',
+    PaidAmount: Number(amount) || order.TotalAmount,
+    PaidDate: payDateStr ? new Date(payDateStr) : new Date(),
+    PaymentRef1: ref1 || ''
+  });
+  clearCache();
+  logAction(username, 'CONFIRM_PAYMENT_FROM_FILE', orderId + ' (Ref.1: ' + ref1 + ', ' + amount + ' บาท)');
+  return safeJson({ ok: true });
+}
+
+function cancelOrder(orderId, username, token) {
+  const session = requireAuth(token);
+  const { rows } = readTable(SHEET_ORDERS);
+  const order = rows.find(o => o.OrderID === orderId);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบคำสั่งจอง' });
+  if (session.permission === ROLE_BRANCH && order.UnitName !== session.unitName) {
+    return safeJson({ ok: false, message: 'คุณไม่มีสิทธิ์ยกเลิกคำสั่งจองของหน่วยงานอื่น' });
+  }
+  // ยกเลิกได้เฉพาะกรณีที่ยังไม่ได้ชำระเงินเท่านั้น (ตามหน้าจอ Order detail) - ยกเว้น Staff/Patrunning/Donate ที่แม้จะขึ้น
+  // สถานะ "ชำระแล้ว" ตั้งแต่สร้าง แต่ไม่ได้แปลว่ามีเงินจริงเข้าธนาคารและกระทบยอดบัญชีแล้วเหมือน Standard (ที่ยืนยันผ่านไฟล์ธนาคารจริง)
+  // สถานะนั้นแค่หมายถึง "ไม่ต้องรอชำระผ่าน Payin" เท่านั้น ถ้ากรอกผิดพลาดต้องแก้ไขได้ - แต่จำกัดให้ SuperAdmin เท่านั้นที่แก้ไขกรณีนี้ได้
+  // (channel เหล่านี้ถือว่า "ชำระแล้ว" ตั้งแต่สร้างเสมออยู่แล้ว การยกเลิกจึงเป็นเรื่องละเอียดอ่อนกว่ากรณี Waiting ปกติ)
+  if (order.PaymentStatus === 'Paid') {
+    if (order.Channel === CHANNEL_STANDARD) {
+      return safeJson({ ok: false, message: 'ไม่สามารถยกเลิกคำสั่งจองที่ชำระเงินแล้วได้ (ยืนยันการชำระผ่านธนาคารแล้ว)' });
+    }
+    if (session.permission !== ROLE_SUPERADMIN) {
+      return safeJson({ ok: false, message: 'เฉพาะ SuperAdmin เท่านั้นที่ยกเลิกคำสั่งจองประเภทนี้ที่ชำระแล้วได้ (Staff/Patrunning/Donate)' });
+    }
+  }
+  updateRow(SHEET_ORDERS, order._row, { PaymentStatus: 'Cancel' });
+  // เมื่อสถานะเป็น Cancel แล้ว computeStockSummary จะไม่นับเป็น "ขายแล้ว" อีก => สต็อกถูกคืนกลับอัตโนมัติ
+  clearCache();
+  logAction(username, 'CANCEL_ORDER', orderId + ' (คืนสต็อก ' + (order.TotalQty || 0) + ' ชิ้น)');
+  return safeJson({ ok: true });
+}
+
+/**
+ * ค้นหาคำสั่งจองจากเลข Ref.1 หลายรายการพร้อมกัน (Central/SuperAdmin เท่านั้น)
+ * ใช้ตอน parse ไฟล์ชำระเงินธนาคาร เพื่อ auto-fill เลขที่คำสั่งจองให้ผู้ใช้ตรวจสอบก่อนกดยืนยันเอง
+ * (ยัง require ให้ผู้ใช้กดยืนยันเองเสมอ - ไม่ auto-confirm การชำระเงินให้ กันจับคู่ผิดจากข้อมูลเพี้ยน)
+ */
+function lookupOrdersByRef1(ref1List, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const refSet = new Set((ref1List || []).map(r => String(r || '').trim()).filter(Boolean));
+  const { rows } = readTable(SHEET_ORDERS);
+  const result = {};
+  rows.forEach(o => {
+    const r1 = String(o.Ref1 || '').trim();
+    if (r1 && refSet.has(r1)) {
+      result[r1] = {
+        orderId: o.OrderID, unitName: o.UnitName, totalAmount: o.TotalAmount,
+        paymentStatus: o.PaymentStatus, firstName: o.FirstName, lastName: o.LastName
+      };
+    }
+  });
+  return safeJson(result);
+}
+
+/**
+ * พรีวิวคำสั่งจอง Standard ที่ "ครบกำหนดชำระ" (ExpireDate) ตรงกับวันที่ของไฟล์ชำระเงินธนาคาร (HPOSDATE)
+ * แต่ไม่พบเลข Ref.1 อยู่ในไฟล์เลย (แปลว่าไม่ได้ชำระตามกำหนด) - Central/SuperAdmin เท่านั้น
+ * ใช้แสดงให้ผู้ใช้ตรวจสอบก่อนกดยืนยันยกเลิกจริงผ่าน cancelOrdersBatch (ไม่ยกเลิกอัตโนมัติทันทีที่ import ไฟล์)
+ */
+function previewExpiredOrdersNotInFile(ref1List, dueDateISO, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const refSet = new Set((ref1List || []).map(r => String(r || '').trim()).filter(Boolean));
+  const dueDate = new Date(dueDateISO);
+  if (isNaN(dueDate.getTime())) return safeJson({ ok: false, message: 'วันที่ครบกำหนด (HPOSDATE) ในไฟล์ไม่ถูกต้อง' });
+  const { rows } = readTable(SHEET_ORDERS);
+  const targets = rows.filter(o => {
+    if (o.Channel !== CHANNEL_STANDARD) return false;
+    if (o.PaymentStatus !== 'Waiting') return false;
+    if (!o.ExpireDate) return false;
+    const exp = new Date(o.ExpireDate);
+    if (isNaN(exp.getTime())) return false;
+    return exp.getFullYear() === dueDate.getFullYear() && exp.getMonth() === dueDate.getMonth() && exp.getDate() === dueDate.getDate();
+  }).filter(o => !refSet.has(String(o.Ref1 || '').trim()));
+  return safeJson({
+    ok: true,
+    orders: targets.map(o => ({
+      orderId: o.OrderID, ref1: o.Ref1, unitName: o.UnitName,
+      totalAmount: o.TotalAmount, totalQty: o.TotalQty, createdDate: o.CreatedDate,
+      firstName: o.FirstName, lastName: o.LastName
+    }))
+  });
+}
+
+/**
+ * ยกเลิกคำสั่งจองหลายรายการพร้อมกัน (ใช้ต่อจาก previewExpiredOrdersNotInFile หลังผู้ใช้ตรวจสอบและยืนยันแล้วเท่านั้น)
+ * สต็อกคำนวณสดจาก computeStockSummary เสมออยู่แล้ว จึง "recalculate" อัตโนมัติทันทีที่สถานะเปลี่ยนเป็น Cancel ไม่ต้องมีขั้นตอนเพิ่ม
+ */
+function cancelOrdersBatch(orderIds, username, token) {
+  requireAuth(token, ROLES_BACKOFFICE);
+  const { rows } = readTable(SHEET_ORDERS);
+  let successCount = 0;
+  const failList = [];
+  (orderIds || []).forEach(orderId => {
+    const order = rows.find(o => o.OrderID === orderId);
+    if (!order) { failList.push(orderId + ' (ไม่พบคำสั่งจอง)'); return; }
+    if (order.PaymentStatus === 'Paid') { failList.push(orderId + ' (ชำระเงินไปแล้ว ข้ามไป)'); return; }
+    if (order.PaymentStatus === 'Cancel') { successCount++; return; } // ยกเลิกอยู่แล้ว ถือว่าสำเร็จ
+    updateRow(SHEET_ORDERS, order._row, { PaymentStatus: 'Cancel' });
+    successCount++;
+  });
+  clearCache();
+  logAction(username, 'CANCEL_ORDERS_BATCH_PAYMENT_FILE', successCount + ' รายการ' + (failList.length ? (' (ข้าม ' + failList.length + ': ' + failList.join(', ') + ')') : ''));
+  return safeJson({ ok: true, successCount, failList });
+}
+
+/**
+ * ลบคำสั่งจองถาวร: ลบทั้งแถวใน Orders และ OrderItems ที่เกี่ยวข้อง (SuperAdmin เท่านั้น)
+ * สต็อกจะถูกคืนกลับอัตโนมัติ เพราะ computeStockSummary นับ "ขายแล้ว" จาก OrderItems ที่ยังอยู่เท่านั้น
+ */
+function deleteOrder(orderId, username, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  const { rows } = readTable(SHEET_ORDERS);
+  const order = rows.find(o => o.OrderID === orderId);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบคำสั่งจอง' });
+  // ห้ามลบคำสั่งจองที่ชำระเงินแล้วเฉพาะกรณี Standard (ยืนยันผ่านธนาคารจริงแล้ว แก้ไขข้อมูลย้อนหลังไม่ได้ทางบัญชี)
+  // Staff/Patrunning/Donate ขึ้น "ชำระแล้ว" ตั้งแต่สร้างเสมอ แต่ไม่ใช่เงินที่กระทบบัญชีธนาคารจริง จึงลบแก้ไขข้อผิดพลาดได้
+  // (SuperAdmin เท่านั้นที่ทำได้อยู่แล้วตาม requireAuth ด้านบน + ฝั่ง UI มี warning ชัดเจนก่อนลบเสมอ)
+  if (order.PaymentStatus === 'Paid' && order.Channel === CHANNEL_STANDARD) {
+    return safeJson({ ok: false, message: 'ไม่สามารถลบคำสั่งจองที่ชำระเงินแล้วได้ (ยืนยันการชำระผ่านธนาคารแล้ว)' });
+  }
+
+  // ลบรายการสินค้าของออเดอร์นี้ก่อน (เรียงจากแถวล่างขึ้นบน กันแถวเลื่อนตำแหน่ง)
+  const { rows: items } = readTable(SHEET_ORDER_ITEMS);
+  const shItems = sheetGet(SHEET_ORDER_ITEMS);
+  items.filter(i => i.OrderID === orderId)
+    .map(i => i._row)
+    .sort((a, b) => b - a)
+    .forEach(r => shItems.deleteRow(r));
+
+  sheetGet(SHEET_ORDERS).deleteRow(order._row);
+  clearCache();
+  logAction(username, 'DELETE_ORDER', orderId + ' (คืนสต็อก ' + (order.TotalQty || 0) + ' ชิ้น)');
+  return safeJson({ ok: true });
+}
+
+/**
+ * เมนูปรับเปลี่ยนขนาดเสื้อ (Size Revision Management) - SuperAdmin + Staff role
+ * คืนสต็อกไซส์เดิม แล้วตัดสต็อกไซส์ใหม่ให้อัตโนมัติ พร้อมเก็บ log เพื่อตรวจสอบย้อนหลังได้
+ */
+function reviseOrderItemSize(orderItemId, newSize, username, token) {
+  requireAuth(token, ROLES_SIZEREVISION);
+  const { rows: orders } = readTable(SHEET_ORDERS);
+  const { rows: items } = readTable(SHEET_ORDER_ITEMS);
+  const item = items.find(i => i.OrderItemID === orderItemId);
+  if (!item) return safeJson({ ok: false, message: 'ไม่พบรายการที่ต้องการแก้ไข' });
+  const order = orders.find(o => o.OrderID === item.OrderID);
+  if (!order) return safeJson({ ok: false, message: 'ไม่พบคำสั่งจองที่เกี่ยวข้อง' });
+
+  const sizeError = validateSizesForChannel(order.Channel, [newSize]);
+  if (sizeError) return safeJson({ ok: false, message: sizeError });
+
+  const oldSize = item.Size;
+  if (oldSize === newSize) return safeJson({ ok: false, message: 'ไซส์ใหม่เหมือนไซส์เดิม' });
+
+  updateRow(SHEET_ORDER_ITEMS, item._row, { Size: newSize });
+  clearCache();
+  logAction(username, 'SIZE_REVISION', `${item.OrderID} / ${orderItemId}: ${oldSize} -> ${newSize} (คืนสต็อก ${oldSize}, ตัดสต็อก ${newSize})`);
+  return safeJson({ ok: true, oldSize, newSize });
+}
+
+/**
+ * Time-driven trigger เท่านั้น (ไม่ได้ถูกเรียกจาก client ผ่าน google.script.run)
+ * ไม่ต้องมี token เพราะ Apps Script trigger รันด้วยสิทธิ์เจ้าของสคริปต์อยู่แล้ว
+ * ตัดรอบตามเวลา cutoff ที่ตั้งค่าไว้ (default 23:30 ของวันเดียวกับที่จอง) แทนการนับ 24 ชม.
+ */
+function cancelExpiredOrders() {
+  const { rows } = readTable(SHEET_ORDERS);
+  const now = new Date();
+  let count = 0;
+  rows.forEach(o => {
+    if (o.PaymentStatus === 'Waiting' && o.ExpireDate && new Date(o.ExpireDate) < now) {
+      updateRow(SHEET_ORDERS, o._row, { PaymentStatus: 'Cancel' });
+      count++;
+    }
+  });
+  if (count > 0) { clearCache(); logAction('SYSTEM', 'AUTO_CANCEL', `${count} orders expired`); }
+  return count;
+}
+
+/*************************************************************
+ * DASHBOARD
+ *************************************************************/
+function getDashboardData(filter, token) {
+  requireAuth(token); // Branch เห็น Dashboard ได้แล้ว (เหมือน Central) แต่ยังดู Stock/Report ไม่ได้
+  filter = filter || {};
+  const isUnfiltered = !filter.dateFrom && !filter.dateTo && !filter.unitName;
+  if (isUnfiltered) {
+    const cached = cacheGet().get('dashboardBase');
+    if (cached) return JSON.parse(cached);
+  }
+  const result = computeDashboardData(filter);
+  if (isUnfiltered) cacheGet().put('dashboardBase', JSON.stringify(result), CACHE_TTL);
+  return safeJson(result);
+}
+function computeDashboardData(filter) {
+  const stock = computeStockSummary();
+  const { rows: orders } = readTable(SHEET_ORDERS);
+
+  let inRange = orders;
+  if (filter.dateFrom) inRange = inRange.filter(o => new Date(o.CreatedDate) >= new Date(filter.dateFrom));
+  if (filter.dateTo) inRange = inRange.filter(o => new Date(o.CreatedDate) <= new Date(filter.dateTo));
+  if (filter.unitName) inRange = inRange.filter(o => o.UnitName === filter.unitName);
+
+  // ยอดขายสูงสุดตามหน่วยขายหลัก 10 อันดับ (เฉพาะ General Sales / Standard ที่ชำระแล้ว - ไม่รวมตัวแทน/Patrunning)
+  const byUnit = {};
+  inRange.filter(o => o.PaymentStatus === 'Paid' && o.Channel === CHANNEL_STANDARD).forEach(o => {
+    if (!byUnit[o.UnitName]) byUnit[o.UnitName] = { amount: 0, qty: 0 };
+    byUnit[o.UnitName].amount += Number(o.TotalAmount || 0);
+    byUnit[o.UnitName].qty += Number(o.TotalQty || 0);
+  });
+  const topUnits = Object.entries(byUnit).sort((a, b) => b[1].amount - a[1].amount).slice(0, 10)
+    .map(([unit, v]) => ({ unit, amount: v.amount, qty: v.qty }));
+  const maxUnitAmount = topUnits.length ? topUnits[0].amount : 0;
+
+  // สัดส่วนการทำรายการจองทั้ง 4 ประเภท (นับจำนวนใบจองทั้งหมด ไม่รวม Cancel)
+  const channelCounts = { Standard: 0, Patrunning: 0, Donate: 0, Staff: 0 };
+  inRange.filter(o => o.PaymentStatus !== 'Cancel').forEach(o => {
+    if (channelCounts[o.Channel] !== undefined) channelCounts[o.Channel]++;
+  });
+
+  // สรุปยอดแยกตามช่องทาง สำหรับการ์ดสรุปด้านล่าง Dashboard: รอชำระ/ชำระแล้ว/ยอดรับเงินสะสม ต่อช่องทาง
+  // (Standard เท่านั้นที่มีสถานะ "รอชำระ" จริงๆ - ช่องทางอื่นชำระทันทีตอนสร้าง order เสมอ)
+  const channelSummary = {};
+  [CHANNEL_STANDARD, CHANNEL_PATRUNNING, CHANNEL_DONATE, CHANNEL_STAFF].forEach(ch => {
+    channelSummary[ch] = { waitingCount: 0, paidCount: 0, paidAmount: 0 };
+  });
+  inRange.forEach(o => {
+    if (!channelSummary[o.Channel]) return;
+    if (o.PaymentStatus === 'Waiting') channelSummary[o.Channel].waitingCount++;
+    else if (o.PaymentStatus === 'Paid') {
+      channelSummary[o.Channel].paidCount++;
+      channelSummary[o.Channel].paidAmount += Number(o.TotalAmount || 0);
+    }
+  });
+
+  // ยอดรวมแบ่งตามประเภทรายการ และหน่วยงาน
+  const byChannelUnit = {};
+  inRange.filter(o => o.PaymentStatus !== 'Cancel').forEach(o => {
+    const key = o.Channel + '|' + o.UnitName;
+    if (!byChannelUnit[key]) byChannelUnit[key] = { channel: o.Channel, unitName: o.UnitName, qty: 0, amount: 0 };
+    byChannelUnit[key].qty += Number(o.TotalQty || 0);
+    byChannelUnit[key].amount += Number(o.TotalAmount || 0);
+  });
+
+  // ยอดขายรายวัน แยกตามสถานะ (สำหรับกราฟแท่ง - ปริมาณการจองในแต่ละวัน)
+  const dayMap = {};
+  inRange.forEach(o => {
+    const d = new Date(o.CreatedDate);
+    if (isNaN(d)) return;
+    const dayKey = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM');
+    if (!dayMap[dayKey]) dayMap[dayKey] = { waiting: 0, paid: 0, cancel: 0, qty: 0 };
+    const amt = Number(o.TotalAmount || 0);
+    if (o.PaymentStatus === 'Paid') dayMap[dayKey].paid += amt;
+    else if (o.PaymentStatus === 'Waiting') dayMap[dayKey].waiting += amt;
+    else dayMap[dayKey].cancel += amt;
+    dayMap[dayKey].qty += Number(o.TotalQty || 0);
+  });
+  const chart = Object.keys(dayMap).sort().slice(-14).map(k => ({ day: k, ...dayMap[k] }));
+
+  const totalPaidAmount = inRange.filter(o => o.PaymentStatus === 'Paid').reduce((s, o) => s + Number(o.TotalAmount || 0), 0);
+  const totalWaiting = inRange.filter(o => o.PaymentStatus === 'Waiting').length;
+  const totalPaid = inRange.filter(o => o.PaymentStatus === 'Paid').length;
+  const totalCancel = inRange.filter(o => o.PaymentStatus === 'Cancel').length;
+  const overbookSizes = stock.filter(s => s.overbooked);
+
+  return {
+    stock, topUnits, maxUnitAmount, chart, totalPaidAmount, totalWaiting, totalPaid, totalCancel,
+    channelCounts, channelSummary, byChannelUnit: Object.values(byChannelUnit), overbookSizes
+  };
+}
+
+/*************************************************************
+ * EXPORT CSV (เดิม - ใช้กับหน้าคำสั่งจอง ตอนนี้ไม่มีปุ่มเรียกแล้วแต่คงฟังก์ชันไว้เผื่อใช้)
+ *************************************************************/
+function exportCSV(filter, token) {
+  requireAuth(token, ROLES_REPORTS);
+  const orders = getOrders(filter, token);
+  const headers = ['OrderID', 'CreatedDate', 'Channel', 'UnitName', 'TargetUnit', 'PayerType', 'FirstName', 'LastName', 'CompanyName', 'PaymentStatus', 'TotalQty', 'TotalAmount', 'PaidDate'];
+  let csv = headers.join(',') + '\n';
+  orders.forEach(o => {
+    const line = headers.map(h => {
+      let v = o[h] !== undefined ? o[h] : '';
+      return `"${String(v).replace(/"/g, '""')}"`;
+    });
+    csv += line.join(',') + '\n';
+  });
+  return csv;
+}
+/**
+ * Export ระดับรายบุคคล (ผู้เข้าร่วมแต่ละคน) รวมทั้งอายุจริง (AgeYears) และรหัสช่วงอายุ (Age) ทั้งคู่
+ */
+function exportParticipantsCSV(filter, token) {
+  requireAuth(token, ROLES_REPORTS);
+  const orders = getOrders(filter, token);
+  const orderById = {};
+  orders.forEach(o => orderById[o.OrderID] = o);
+  const { rows: items } = readTable(SHEET_ORDER_ITEMS);
+  const relevantItems = items.filter(i => orderById[i.OrderID]);
+  const headers = ['OrderID', 'Channel', 'UnitName', 'ParticipantGroup', 'FirstName', 'LastName', 'Gender', 'AgeYears', 'AgeCode', 'Distance', 'Size', 'PricePerUnit'];
+  let csv = headers.join(',') + '\n';
+  relevantItems.forEach(i => {
+    const o = orderById[i.OrderID] || {};
+    const line = headers.map(h => {
+      let v;
+      if (h === 'Channel') v = o.Channel;
+      else if (h === 'UnitName') v = o.UnitName || o.TargetUnit;
+      else if (h === 'AgeCode') v = i.Age;
+      else if (h === 'AgeYears') v = i.AgeYears;
+      else v = i[h];
+      if (v === undefined || v === null) v = '';
+      return `"${String(v).replace(/"/g, '""')}"`;
+    });
+    csv += line.join(',') + '\n';
+  });
+  return csv;
+}
+
+/*************************************************************
+ * REPORTS (หน้า "รายงาน") - ค้นหาตามช่วงวันที่ + Export เป็น Excel จริง
+ *************************************************************/
+/**
+ * รายงานคำสั่งจองสำหรับหน้า "รายงาน" - ค้นหาได้ตามช่วงวันที่ (CreatedDate, from-to)
+ * ไม่รวมรายการที่ยกเลิกเสมอ (รายการที่ลบถาวรแล้วก็ไม่มีอยู่ในชีท Orders อยู่แล้ว ไม่ต้องกรองซ้ำ)
+ */
+function getReportOrders(filter, token) {
+  requireAuth(token, ROLES_REPORTS);
+  const { rows } = readTable(SHEET_ORDERS);
+  let result = rows.filter(o => o.PaymentStatus !== 'Cancel');
+  if (filter) {
+    if (filter.dateFrom) {
+      const from = new Date(filter.dateFrom);
+      result = result.filter(o => new Date(o.CreatedDate) >= from);
+    }
+    if (filter.dateTo) {
+      const to = new Date(filter.dateTo);
+      to.setHours(23, 59, 59, 999); // รวมทั้งวันสุดท้ายของช่วง
+      result = result.filter(o => new Date(o.CreatedDate) <= to);
+    }
+    if (filter.channel) result = result.filter(o => o.Channel === filter.channel);
+    // สถานะเลือกได้เฉพาะ Waiting/Paid เท่านั้น (ไม่มีตัวเลือก Cancel ให้ค้นหา เพราะไม่แสดงรายการยกเลิกอยู่แล้วตามที่กำหนด)
+    if (filter.paymentStatus) result = result.filter(o => o.PaymentStatus === filter.paymentStatus);
+  }
+  return safeJson(result.sort((a, b) => new Date(a.CreatedDate) - new Date(b.CreatedDate)));
+}
+
+/**
+ * Export ข้อมูลสำหรับออกใบเสร็จ (Receipt Export) - ตาม Layout ที่กำหนด
+ * เฉพาะคำสั่งจองประเภทหน่วยขาย (Standard) ที่ชำระเงินแล้วเท่านั้น ไม่รวม Patrunning/Donate/Staff
+ * 1 คำสั่งจอง = 1 แถว: ถ้าจองแบบเดี่ยว (1 รายการ) จะใส่รายละเอียดไซส์/เพศ/ช่วงอายุ/ประเภทงานให้
+ *                       ถ้าจองแบบกลุ่ม (หลายรายการ) จะเว้นว่างฟิลด์รายบุคคลเหล่านี้ไว้ตาม spec
+ * ใช้ข้อมูลใบเสร็จ (Receipt*) ถ้าคำสั่งจองระบุว่าต้องการใบเสร็จไว้ (WantReceipt=Y) ไม่งั้น fallback ไปข้อมูลผู้สั่งจองทั่วไป
+ * หมายเหตุ: คอลัมน์ ENT_NAME / JOG_GROUP_TYPE / TAB_CGD_OFFICER_PK ยังคงอยู่ในไฟล์เสมอ (ตาม Layout ที่กำหนด)
+ * แต่ "ไม่ต้องระบุค่า" ตามเอกสาร spec จึงปล่อยเป็นค่าว่างเสมอทุกแถว ไม่ใช่ตัดคอลัมน์ออก
+ */
+function getReceiptExportData(filter, token) {
+  requireAuth(token, ROLES_REPORTS);
+  const { rows: orders } = readTable(SHEET_ORDERS);
+  let targets = orders.filter(o => o.Channel === CHANNEL_STANDARD && o.PaymentStatus === 'Paid');
+  if (filter) {
+    if (filter.dateFrom) {
+      const from = new Date(filter.dateFrom);
+      targets = targets.filter(o => new Date(o.CreatedDate) >= from);
+    }
+    if (filter.dateTo) {
+      const to = new Date(filter.dateTo);
+      to.setHours(23, 59, 59, 999);
+      targets = targets.filter(o => new Date(o.CreatedDate) <= to);
+    }
+  }
+  const { rows: allItems } = readTable(SHEET_ORDER_ITEMS);
+  const tz = Session.getScriptTimeZone() || 'Asia/Bangkok';
+  const rowsOut = targets.map(o => {
+    const items = allItems.filter(i => i.OrderID === o.OrderID);
+    const isSingle = items.length === 1;
+    const item0 = isSingle ? items[0] : null;
+    const wantReceipt = o.WantReceipt === 'Y';
+    const peopleName = (wantReceipt && o.ReceiptName) ? o.ReceiptName : (((o.FirstName || '') + ' ' + (o.LastName || '')).trim() || o.CompanyName || '');
+    const taxNo = (wantReceipt && o.ReceiptTaxID) ? o.ReceiptTaxID : (o.TaxID || '');
+    const addressInfo = (wantReceipt && o.ReceiptAddress) ? o.ReceiptAddress : (o.CompanyAddress || '');
+    const remarkEmail = (wantReceipt && o.ReceiptEmail) ? o.ReceiptEmail : (o.Email || '');
+    const compType = item0 ? (item0.Distance === '5กม.' ? 'W' : (item0.Distance === '10กม.' ? 'R' : '')) : '';
+    const compGender = item0 ? (item0.Gender === 'ชาย' ? 'M' : (item0.Gender === 'หญิง' ? 'F' : '')) : '';
+    const compGroup = item0 ? (item0.Age || '') : '';
+    const compShirtType = item0 ? (item0.Size || '') : '';
+    let paidDate = '';
+    if (o.PaidDate) {
+      const d = new Date(o.PaidDate);
+      if (!isNaN(d.getTime())) paidDate = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+    }
+    return {
+      ENT_NAME: '', JOG_GROUP_TYPE: '',
+      PEOPLE_NAME: peopleName, TAX_NO: String(taxNo || ''), TEL_NO: String(o.Phone || ''),
+      ADDRESS_INFO: addressInfo,
+      COMP_TYPE: compType, COMP_GENDER: compGender, COMP_GROUP: compGroup, COMP_SHIRT_TYPE: compShirtType,
+      PAYMENT_TYPE: 'TR', CHEQE_DATE: paidDate, BILL_DONATION: Number(o.TotalAmount || 0),
+      TAB_CGD_UNIT_PK: o.UnitName || '', TAB_CGD_OFFICER_PK: '', COMP_REMARK: remarkEmail
+    };
+  });
+  return safeJson(rowsOut);
+}
+
+/**
+ * บันทึกประวัติการ Export ลง audit log แบบ key-value (เช่น "DateFrom=2026-08-01; DateTo=2026-08-27; RecordCount=42")
+ * เพื่อให้ตรวจสอบย้อนหลังได้ว่าใคร export อะไรไปบ้าง ด้วยเงื่อนไขอะไร เมื่อไหร่
+ */
+function logExportAction(exportType, detailObj, username, token) {
+  requireAuth(token, ROLES_REPORTS);
+  const detail = Object.keys(detailObj || {}).map(k => k + '=' + (detailObj[k] === undefined || detailObj[k] === null || detailObj[k] === '' ? '(all)' : detailObj[k])).join('; ');
+  logAction(username, exportType, detail);
+  return safeJson({ ok: true });
+}
+
+/*************************************************************
+ * ADMIN - USERS (ต้องมีสิทธิ์ SuperAdmin เท่านั้น)
+ *************************************************************/
+function getUsers(token) {
+  requireAuth(token, ROLES_USERADMIN);
+  const { rows } = readTable(SHEET_USERS);
+  return safeJson(rows.map(u => ({
+    username: u.Username, name: u.Name, surname: u.Surname, unitName: u.UnitName,
+    phone: u.Phone, permission: normalizeRole(u.Permission), createdDate: u.CreatedDate, lastLogin: u.LastLogin, status: u.Status
+  })));
+}
+function addUser(payload, adminUsername, token) {
+  const session = requireAuth(token, ROLES_USERADMIN);
+  // Central จัดการผู้ใช้งานได้ แต่ตั้งค่า/เลื่อนใครเป็น SuperAdmin ไม่ได้ (กันสิทธิ์ยกระดับตัวเอง) - SuperAdmin เท่านั้นที่ทำได้
+  if (payload.permission === ROLE_SUPERADMIN && session.permission !== ROLE_SUPERADMIN) {
+    return safeJson({ ok: false, message: 'เฉพาะ SuperAdmin เท่านั้นที่สร้างผู้ใช้งานระดับ SuperAdmin ได้' });
+  }
+  const { rows } = readTable(SHEET_USERS);
+  if (rows.some(u => u.Username === payload.username)) return safeJson({ ok: false, message: 'มีชื่อผู้ใช้งานนี้แล้ว' });
+  ensureTextColumns(SHEET_USERS, ['Phone']); // กันเบอร์โทรขึ้นต้นด้วย 0 ถูกตัดทิ้ง
+  appendRow(SHEET_USERS, {
+    Username: payload.username, PasswordHash: simpleHash(payload.password), Name: payload.name, Surname: payload.surname,
+    UnitName: payload.unitName, Phone: formatThaiPhone(payload.phone), Permission: payload.permission || ROLE_BRANCH,
+    CreatedDate: new Date(), LastLogin: '', Status: 'Active'
+  });
+  logAction(adminUsername, 'ADD_USER', payload.username);
+  return safeJson({ ok: true });
+}
+function editUser(payload, adminUsername, token) {
+  const session = requireAuth(token, ROLES_USERADMIN);
+  const { rows } = readTable(SHEET_USERS);
+  const u = rows.find(x => x.Username === payload.username);
+  if (!u) return safeJson({ ok: false, message: 'ไม่พบผู้ใช้งาน' });
+  // Central เลื่อนใครเป็น SuperAdmin หรือแก้ไขบัญชี SuperAdmin ที่มีอยู่แล้วไม่ได้ - SuperAdmin เท่านั้นที่ทำได้
+  if (session.permission !== ROLE_SUPERADMIN && (payload.permission === ROLE_SUPERADMIN || normalizeRole(u.Permission) === ROLE_SUPERADMIN)) {
+    return safeJson({ ok: false, message: 'เฉพาะ SuperAdmin เท่านั้นที่แก้ไขบัญชีระดับ SuperAdmin ได้' });
+  }
+  ensureTextColumns(SHEET_USERS, ['Phone']); // กันเบอร์โทรขึ้นต้นด้วย 0 ถูกตัดทิ้ง
+  const upd = { Name: payload.name, Surname: payload.surname, UnitName: payload.unitName, Phone: formatThaiPhone(payload.phone), Permission: payload.permission, Status: payload.status };
+  if (payload.password) upd.PasswordHash = simpleHash(payload.password);
+  updateRow(SHEET_USERS, u._row, upd);
+  logAction(adminUsername, 'EDIT_USER', payload.username);
+  return safeJson({ ok: true });
+}
+function deleteUser(username, adminUsername, token) {
+  const session = requireAuth(token, ROLES_USERADMIN);
+  // ห้ามลบบัญชี admin หลัก ไม่งั้นจะไม่เหลือ root เข้าระบบ
+  if (String(username).trim().toLowerCase() === 'admin') {
+    return safeJson({ ok: false, message: 'ไม่สามารถลบผู้ใช้งาน "admin" ได้ (เป็นบัญชีผู้ดูแลระบบหลัก)' });
+  }
+  const { rows } = readTable(SHEET_USERS);
+  const u = rows.find(x => x.Username === username);
+  if (!u) return safeJson({ ok: false, message: 'ไม่พบผู้ใช้งาน' });
+  // Central ลบบัญชี SuperAdmin ไม่ได้
+  if (session.permission !== ROLE_SUPERADMIN && normalizeRole(u.Permission) === ROLE_SUPERADMIN) {
+    return safeJson({ ok: false, message: 'เฉพาะ SuperAdmin เท่านั้นที่ลบบัญชีระดับ SuperAdmin ได้' });
+  }
+  sheetGet(SHEET_USERS).deleteRow(u._row);
+  logAction(adminUsername, 'DELETE_USER', username);
+  return safeJson({ ok: true });
+}
+/**
+ * SuperAdmin รีเซ็ตรหัสผ่านให้ผู้ใช้งานคนอื่น (แยกจาก editUser เพื่อให้เป็น action เฉพาะ กดง่าย ไม่ต้องเปิดฟอร์มแก้ไขทั้งหมด)
+ */
+function resetUserPassword(username, newPassword, adminUsername, token) {
+  requireAuth(token, ROLE_SUPERADMIN);
+  if (!newPassword || String(newPassword).length < 6) {
+    return safeJson({ ok: false, message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร' });
+  }
+  const { rows } = readTable(SHEET_USERS);
+  const u = rows.find(x => x.Username === username);
+  if (!u) return safeJson({ ok: false, message: 'ไม่พบผู้ใช้งาน' });
+  updateRow(SHEET_USERS, u._row, { PasswordHash: simpleHash(newPassword) });
+  logAction(adminUsername, 'RESET_PASSWORD', 'admin=' + adminUsername + '; target=' + username);
+  return safeJson({ ok: true });
+}
+/**
+ * ผู้ใช้งานเปลี่ยนรหัสผ่านของตัวเอง (ต้องกรอกรหัสผ่านปัจจุบันให้ถูกก่อนเสมอ ทุก role ใช้ได้)
+ */
+function changeMyPassword(currentPassword, newPassword, username, token) {
+  const session = requireAuth(token);
+  if (!newPassword || String(newPassword).length < 6) {
+    return safeJson({ ok: false, message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร' });
+  }
+  const { rows } = readTable(SHEET_USERS);
+  const u = rows.find(x => x.Username === session.username);
+  if (!u) return safeJson({ ok: false, message: 'ไม่พบผู้ใช้งาน' });
+  if (String(u.PasswordHash) !== simpleHash(currentPassword)) {
+    return safeJson({ ok: false, message: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
+  }
+  updateRow(SHEET_USERS, u._row, { PasswordHash: simpleHash(newPassword) });
+  logAction(session.username, 'CHANGE_PASSWORD', 'self-service');
+  return safeJson({ ok: true });
+}
+function getLogs(limit, actionFilter, token) {
+  requireAuth(token, ROLES_USERADMIN);
+  const { rows } = readTable(SHEET_LOG);
+  let result = rows;
+  if (actionFilter) result = result.filter(r => r.Action === actionFilter);
+  return safeJson(result.sort((a, b) => new Date(b.DateTime) - new Date(a.DateTime)).slice(0, limit || 200));
+}
+
+/*************************************************************
+ * ONE-TIME SETUP (รันเองจาก Apps Script editor เท่านั้น ไม่เกี่ยวกับ client)
+ *************************************************************/
+function setupSpreadsheet() {
+  const ss = ssGet();
+  function ensureSheet(name, headers) {
+    let sh = ss.getSheetByName(name);
+    if (!sh) sh = ss.insertSheet(name);
+    sh.clear();
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    return sh;
+  }
+
+  ensureSheet(SHEET_USERS, ['Username', 'PasswordHash', 'Name', 'Surname', 'UnitName', 'Phone', 'Permission', 'CreatedDate', 'LastLogin', 'Status']);
+  ensureSheet(SHEET_LOG, ['DateTime', 'Username', 'Action', 'Detail']);
+  ensureSheet(SHEET_UNITS, ['UnitName', 'Channel', 'UnitCode', 'Status']);
+  ensureSheet(SHEET_ORDERS, ['OrderID', 'CreatedDate', 'CreatedBy', 'Channel', 'UnitName', 'TargetUnit', 'TargetUnitCode', 'DonationDetail', 'PayerType', 'Title', 'FirstName', 'LastName', 'Email', 'Phone', 'IdNumber', 'TaxID', 'CompanyName', 'CompanyAddress', 'PaymentStatus', 'PaidAmount', 'PaidDate', 'PaymentFileURL', 'ExpireDate', 'TotalQty', 'TotalAmount', 'HasPayin', 'PaymentRef1', 'Ref1', 'Ref2', 'BookingNo', 'WantReceipt', 'ReceiptName', 'ReceiptTaxID', 'ReceiptAddress', 'ReceiptEmail', 'PayinViewedAt', 'PayinViewedBy']);
+  ensureSheet(SHEET_ORDER_ITEMS, ['OrderItemID', 'OrderID', 'ParticipantGroup', 'FirstName', 'LastName', 'Age', 'AgeYears', 'Gender', 'Distance', 'Size', 'PricePerUnit']);
+  ensureSheet(SHEET_STOCK, ['Size']);
+  ensureSheet(SHEET_ROUNDS, ['RoundID', 'RoundName', 'CreatedDate', 'CreatedBy', 'AttachmentURL', 'TotalQty', 'TotalCost']);
+  ensureSheet(SHEET_ROUND_ITEMS, ['RoundID', 'Size', 'Qty', 'CostPerUnit', 'Subtotal']);
+  ensureSheet(SHEET_SETTINGS, ['Key', 'Value']);
+
+  // ตั้งคอลัมน์ที่มักขึ้นต้นด้วยเลข 0 ให้เป็น Plain Text ตั้งแต่แรก กันเลข 0 หน้าเบอร์โทร/เลขบัตรหายตอนบันทึก
+  ensureTextColumns(SHEET_ORDERS, ['Phone', 'IdNumber', 'TaxID', 'ReceiptTaxID']);
+  ensureTextColumns(SHEET_USERS, ['Phone']);
+
+  sheetGet(SHEET_USERS).appendRow(['admin', simpleHash('admin123'), 'ผู้ดูแลระบบ', '-', 'กรมบัญชีกลาง', '-', ROLE_SUPERADMIN, new Date(), '', 'Active']);
+  SIZES.forEach(sz => sheetGet(SHEET_STOCK).appendRow([sz]));
+  sheetGet(SHEET_SETTINGS).appendRow(['StockAlertQty', 20]);
+  sheetGet(SHEET_SETTINGS).appendRow(['DefaultShirtPrice', 300]);
+  sheetGet(SHEET_SETTINGS).appendRow(['Price5KM', 500]);
+  sheetGet(SHEET_SETTINGS).appendRow(['Price10KM', 600]);
+  sheetGet(SHEET_SETTINGS).appendRow(['CutoffTime', '23:30']);
+  sheetGet(SHEET_SETTINGS).appendRow(['CompCode', '97386']);
+  sheetGet(SHEET_SETTINGS).appendRow(['BillerID', '099400015951040']);
+  sheetGet(SHEET_SETTINGS).appendRow(['ProjectName', 'จัดเดิน-วิ่ง "กรมบัญชีกลาง มินิมาราธอน"']);
+
+  const defaultUnits = [
+    ['สนง. คลังจังหวัด', 'Standard', '01'], ['สนง. คลังเขต', 'Standard', '02'], ['หน่วยงานส่วนกลาง', 'Standard', '03'],
+    ['ทีมสปอนเซอร์', 'Standard', '04'], ['บูธ ทีม 1', 'Standard', '05'], ['บูธ ทีม 2', 'Standard', '06'],
+    ['Patrunning', 'Patrunning', ''], ['Donate/Sponsor', 'Donate', ''], ['เบิกใช้ภายใน', 'Standard', '07']
+  ];
+  defaultUnits.forEach(u => sheetGet(SHEET_UNITS).appendRow([u[0], u[1], u[2], 'Active']));
+
+  SpreadsheetApp.getUi().alert('ตั้งค่าเสร็จสมบูรณ์! Username: admin / Password: admin123 (Role: SuperAdmin) กรุณาเปลี่ยนรหัสผ่านทันที\n\nอย่าลืมตรวจสอบ/แก้ Comp Code และ Biller ID ในหน้า Settings ให้ตรงกับที่ธนาคารออกให้จริง!');
+}
+
+function setupTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'cancelExpiredOrders') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('cancelExpiredOrders').timeBased().everyHours(1).create();
+  Logger.log('Trigger created.');
+}
+
+/** เรียกครั้งเดียวเพื่อขอสิทธิ์ Drive ให้ครบ (แก้ปัญหา authorize ไม่สมบูรณ์) */
+function testDriveAuth() {
+  const folder = DriveApp.getRootFolder();
+  Logger.log('Drive OK: ' + folder.getName());
+}
+
+/**
+ * รันเองครั้งเดียวจาก Apps Script editor (กด Run) ถ้าเจอปัญหาเบอร์โทร/เลขบัตรขึ้นต้นด้วย 0 หายไปอีก
+ * เพื่อบังคับ format คอลัมน์ที่เกี่ยวข้องให้เป็น Plain Text ใหม่ทันที (เผื่อกรณี deploy เวอร์ชันเก่าค้างอยู่)
+ * หมายเหตุ: ค่าที่เลข 0 หายไปแล้วในแถวเก่า กู้คืนอัตโนมัติไม่ได้ ต้องแก้ไขในชีทเองสำหรับแถวเก่า
+ */
+function fixPhoneTextFormatNow() {
+  ensureTextColumns(SHEET_ORDERS, ['Phone', 'IdNumber', 'TaxID', 'ReceiptTaxID']);
+  ensureTextColumns(SHEET_USERS, ['Phone']);
+  SpreadsheetApp.getUi().alert('ตั้งค่าคอลัมน์ Phone/IdNumber/TaxID เป็น Plain Text เรียบร้อย - คำสั่งจอง/ผู้ใช้ใหม่ต่อจากนี้จะไม่มีปัญหาเลข 0 หน้าหายอีก (ข้อมูลเก่าที่หายไปแล้วต้องแก้เองในชีท)');
+}
